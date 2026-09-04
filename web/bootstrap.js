@@ -47,12 +47,13 @@
     if (reported++ > 12) return;
     var extra = ' [transport=' + mode + '] [lastDelivered: ' + lastDelivered.join(' | ') + ']';
     try {
+      // .catch: the reporter must never produce the very rejection it reports
       fetch('api/log', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ href: window.location.href, kind: kind, message: message + extra, stack: stack || '' }),
         keepalive: true
-      });
+      }).catch(function () { /* ignore */ });
     } catch (e) { /* ignore */ }
     try {
       var el = document.getElementById('zcode-webui-error');
@@ -324,7 +325,10 @@
     var id = httpSessionId;
     httpSessionId = null;
     try {
-      fetch('bridge/close?id=' + encodeURIComponent(id), { method: 'POST', keepalive: true });
+      // .catch: a rejection here (page hiding, network gone) fires the global
+      // unhandledrejection handler, which would call report() on a dying page
+      fetch('bridge/close?id=' + encodeURIComponent(id), { method: 'POST', keepalive: true })
+        .catch(function () { /* ignore */ });
     } catch (e) { /* ignore */ }
   }
   window.addEventListener('pagehide', function (ev) {
