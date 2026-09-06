@@ -7,7 +7,7 @@
 // ZCODE_WEBUI_OAUTH_PROXY, ZCODE_SERVER_RUNTIME_ROOT.
 
 import http from 'node:http';
-import { createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, createReadStream, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -16,6 +16,7 @@ import { WebSocketServer } from 'ws';
 import { encodeFrame, FrameParser } from './frame.mjs';
 import { rpcLogLine, decodeRpcHeader, rewriteRpcId, encodeRpcHeader } from './rpclog.mjs';
 import { spawnHost, handshake, resolveServerRoot } from './host.mjs';
+import { LATEST_PAGE_URLS, parseVersionsFromPage, currentRendererVersion, currentServerAppVersion } from './upgrade.mjs';
 import { startLogin, stopLogin, loginState, credentialsPath } from './login.mjs';
 import { resolvePaths } from './dirs.mjs';
 
@@ -453,6 +454,126 @@ function readProcessMonitorPage() {
   return html;
 }
 
+// ---------- update check (Help menu → 检查更新) ----------
+// Compares the DEPLOYED official components (vendor/renderer + ~/.zcode/server)
+// against the version published on the official ZCode pages — i.e. exactly
+// what `zcode-webui upgrade` would download, unpack and deploy. Not related to
+// the webui package's own npm/git version. Uses native fetch (NOT the
+// readRemoteText helper in upgrade.mjs — that one shells out to curl via
+// spawnSync, which would block the server's event loop and stall live
+// sessions). Result is cached so menu re-opens don't refetch the pages.
+const UPDATE_CHECK_CACHE_MS = 5 * 60 * 1000;
+let updateCheckCache = null; // {ts, result}
+
+function semverGt(a, b) {
+  const pa = String(a).replace(/^v/, '').split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = String(b).replace(/^v/, '').split('.').map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) > (pb[i] || 0)) return true;
+    if ((pa[i] || 0) < (pb[i] || 0)) return false;
+  }
+  return false;
+}
+
+// deployed official-component versions; null when missing/not installed
+function deployedComponentVersions() {
+  const renderer = currentRendererVersion(RENDERER_DIR);
+  let server = null;
+  try { server = serverRoot ? currentServerAppVersion(serverRoot) : null; } catch (_e) { /* ignore */ }
+  return { renderer, server };
+}
+
+async function fetchOfficialLatest() {
+  let lastErr = null;
+  for (const url of LATEST_PAGE_URLS) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(10000), redirect: 'follow' });
+      if (!res.ok) { lastErr = new Error('HTTP ' + res.status + ' ' + url); continue; }
+      const html = await res.text();
+      let best = null;
+      for (const v of parseVersionsFromPage(html)) {
+        if (!best || semverGt(v, best)) best = v;
+      }
+      if (best) return { version: best, source: url };
+      lastErr = new Error('no version found in page ' + url);
+    } catch (err) { lastErr = err; }
+  }
+  throw lastErr || new Error('official pages unreachable');
+}
+
+function officialUpdateState() {
+  const { renderer, server } = deployedComponentVersions();
+  const current = renderer && server
+    ? (semverGt(renderer, server) ? renderer : server)
+    : (renderer || server || null);
+  return fetchOfficialLatest().then(({ version, source }) => {
+    const result = {
+      current, latest: version, source,
+      rendererVersion: renderer,
+      serverVersion: server,
+      hasUpdate: (renderer ? semverGt(version, renderer) : true) || (server ? semverGt(version, server) : true),
+    };
+    updateCheckCache = { ts: Date.now(), result };
+    return result;
+  }).catch((err) => {
+    const result = {
+      current, latest: null,
+      rendererVersion: renderer,
+      serverVersion: server,
+      hasUpdate: false,
+      error: String((err && err.message) || err),
+    };
+    updateCheckCache = { ts: Date.now(), result };
+    return result;
+  });
+}
+
+// ---------- log export (Help menu → 导出日志) ----------
+// Plain-text bundle: service snapshot + process tree + the service log tail.
+// The browser side turns this into a downloaded file; the renderer's own toast
+// flow just needs window.zcode.exportLogs() to resolve {success}.
+function logExportBody() {
+  const lines = [];
+  lines.push('==== zcode-webui log export ====');
+  lines.push('exportedAt: ' + new Date().toISOString());
+  lines.push('');
+  lines.push('==== service ====');
+  lines.push('version: ' + pkgVersion);
+  lines.push('node: ' + process.version + ' (' + process.platform + ' ' + process.arch + ')');
+  lines.push('pid: ' + process.pid + '  uptime: ' + Math.round(process.uptime()) + 's');
+  lines.push('workspace: ' + WORKSPACE);
+  lines.push('serverRoot: ' + (serverRoot || '(unresolved)'));
+  lines.push('dataHome: ' + PATHS.dataHome);
+  const live = [...sessions.values()].filter((s) => !s.closed);
+  lines.push('host sessions: ' + live.length + ' (views: ' + live.reduce((n, s) => n + s.views.size, 0) + ', http relays: ' + httpRelays.size + ')');
+  const withHello = live.find((s) => s.hello);
+  if (withHello) lines.push('hostVersion: ' + (withHello.hello.version || '?'));
+  lines.push('');
+  lines.push('==== process tree ====');
+  const walk = (n, depth) => {
+    lines.push('  '.repeat(depth) + n.pid + '  ' + n.cpu.toFixed(1) + '%  ' + (n.memory / 1024).toFixed(1) + 'MB  ' + n.name);
+    for (const c of n.children || []) walk(c, depth + 1);
+  };
+  try { walk(processMetricsTree(), 0); } catch (_e) { lines.push('(unavailable)'); }
+  lines.push('');
+  lines.push('==== service log tail (zcode-webui.log, last 256 KiB) ====');
+  const logPath = path.join(ROOT, 'zcode-webui.log');
+  try {
+    const st = statSync(logPath);
+    const start = Math.max(0, st.size - 256 * 1024);
+    const fh = openSync(logPath, 'r');
+    try {
+      const buf = Buffer.alloc(st.size - start);
+      readSync(fh, buf, 0, buf.length, start);
+      lines.push(start > 0 ? '(…truncated ' + start + ' bytes…)' : '');
+      lines.push(buf.toString('utf8'));
+    } finally { closeSync(fh); }
+  } catch (e) {
+    lines.push('(log file unreadable: ' + (e && e.message) + ')');
+  }
+  return lines.join('\n');
+}
+
 // ---------- login ----------
 let loginRun = null; // {child, url(), output()}
 let loginLog = '';
@@ -882,12 +1003,17 @@ function handleRequest(req, res) {
   // api
   if (urlPath === '/api/health') {
     const all = [...sessions.values()];
+    const withHello = all.find((s) => !s.closed && s.hello);
     return sendJson(res, 200, {
       ok: true, name: 'zcode-webui', version: pkgVersion, base,
       dataHome: PATHS.dataHome,
       rendererLoaded: existsSync(path.join(RENDERER_DIR, 'index.html')),
       serverRoot: serverRoot || null, workspace: WORKSPACE,
       login: loginState(),
+      hostVersion: withHello ? (withHello.hello.version || null) : null,
+      nodeVersion: process.version,
+      pid: process.pid,
+      uptimeSec: Math.round(process.uptime()),
       sessions: {
         total: all.filter((s) => !s.closed).length,
         views: all.reduce((n, s) => n + (s.closed ? 0 : s.views.size), 0),
@@ -1107,6 +1233,25 @@ function handleRequest(req, res) {
   // web/process-monitor-bridge.js); response body IS the tree root, unwrapped
   if (urlPath === '/api/process-metrics' && req.method === 'GET') {
     return sendJson(res, 200, processMetricsTree());
+  }
+
+  // official-component update state for the Help menu's 检查更新 (cached server-side)
+  if (urlPath === '/api/update-check' && req.method === 'GET') {
+    if (updateCheckCache && Date.now() - updateCheckCache.ts < UPDATE_CHECK_CACHE_MS) {
+      return sendJson(res, 200, updateCheckCache.result);
+    }
+    officialUpdateState().then((result) => sendJson(res, 200, result));
+    return;
+  }
+
+  // log bundle download for the Help menu's 导出日志
+  if (urlPath === '/api/logs/export' && req.method === 'GET') {
+    const fname = 'zcode-webui-logs-' + new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + '.txt';
+    return send(res, 200, logExportBody(), {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Content-Disposition': 'attachment; filename="' + fname + '"',
+      'Cache-Control': 'no-store',
+    });
   }
 
   // browser-side diagnostics: POST {href, message, stack}

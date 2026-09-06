@@ -40,7 +40,7 @@ export const CDN_BASE = 'https://cdn-zcode.z.ai/zcode/electron/releases';
 // the same value for standalone shell usage — keep the two in sync.
 export const DEFAULT_VERSION = '3.9.2';
 
-const LATEST_PAGE_URLS = [
+export const LATEST_PAGE_URLS = [
   'https://zcode.z.ai/cn/changelog',
   'https://zcode.z.ai/en/changelog',
   'https://zcode.z.ai/cn/docs/install',

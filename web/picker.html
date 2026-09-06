@@ -40,8 +40,13 @@
   var picked = '';
 
   function sendToOpener(msg) {
-    try { window.opener.postMessage(msg, '*'); } catch (e) { /* ignore */ }
-    window.close();
+    // opened as an in-page overlay (iframe) by zcode-bridge.js → parent;
+    // opened as a popup window (legacy) → opener
+    try {
+      var t = window.parent !== window ? window.parent : window.opener;
+      if (t) t.postMessage(msg, '*');
+    } catch (e) { /* ignore */ }
+    try { window.close(); } catch (e) { /* framed: the host removes the overlay */ }
   }
   function load(p) {
     statusEl.textContent = '';
