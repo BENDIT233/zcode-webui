@@ -670,6 +670,24 @@ function writeToHost(session, view, payload) {
     return true;
   }
   if (process.env.ZCODE_WEBUI_DEBUG_RPC === '1') rpcLogIn(payload);
+  // Pin is broken in the official renderer (a pinned session disappears from
+  // the task list). Swallow setTaskPinned and ack it locally so the host-side
+  // pinned flag never flips; the button becomes a harmless no-op.
+  {
+    const hdr = decodeRpcHeader(payload);
+    if (hdr && hdr.type === 100 && hdr.channel === 'zcodeTaskService' && hdr.method === 'setTaskPinned') {
+      const ackId = session.mux ? ++session.mux.next : hdr.id;
+      const ack = Buffer.concat([
+        encodeRpcHeader([201, ackId, hdr.channel, hdr.method]),
+        Buffer.from([0]),                     // body: preset 0 (undefined)
+      ]);
+      if (session.mux) sendToView(session, { view, origId: hdr.id }, { id: ackId }, ack);
+      else if (view.ws && view.ws.readyState === 1) {
+        try { view.ws.send(ack, { binary: true }); } catch (_e) { /* ignore */ }
+      }
+      return true;
+    }
+  }
   // mux: translate this view's renderer-local ids into the global space
   if (session.mux) {
     const hdr = decodeRpcHeader(payload);
