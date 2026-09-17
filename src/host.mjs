@@ -5,7 +5,7 @@
 
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,6 +21,33 @@ export function rendererVersion(fallback = '') {
     if (v) return v;
   } catch (_e) { /* ignore */ }
   return fallback;
+}
+
+// Official 3.12+ expects the builtin provider catalog next to the CLI entry
+// (agents/glm/provider/zcode-builtin.json) — the desktop app ships it there, the
+// standalone server runtime does NOT. Without it EVERY `zcode.cjs` invocation that
+// matters dies with "无法定位 CLI ZCode Built-in Provider Config": no login
+// (`zcode.cjs login`) and no agent turn (the host spawns `zcode.cjs app-server
+// --stdio` per session). The host materializes its own copy of the same JSON under
+// <dataRoot>/v2/runtime/provider/bundled/zcode-builtin.json when it starts, so once
+// the host has run we can hand that content to the CLI. Idempotent: writes only when
+// the destination is missing, so a runtime-provided file is never clobbered.
+export function ensureCliProviderConfig(serverRoot, { log = () => {} } = {}) {
+  try {
+    const dest = path.join(serverRoot, 'agents', 'glm', 'provider', 'zcode-builtin.json');
+    if (existsSync(dest)) return dest;
+    const dataRoot = process.env.ZCODE_HOME
+      ? path.join(process.env.ZCODE_HOME, 'v2')
+      : path.join(os.homedir(), '.zcode', 'v2');
+    const src = path.join(dataRoot, 'runtime', 'provider', 'bundled', 'zcode-builtin.json');
+    if (!existsSync(src)) return null;
+    mkdirSync(path.dirname(dest), { recursive: true });
+    cpSync(src, dest);
+    log('[zcode-webui] cli provider config materialized: ' + dest);
+    return dest;
+  } catch (_e) {
+    return null; // never block host startup on this
+  }
 }
 
 // Default runtime location follows the official data directory convention:

@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { encodeFrame, FrameParser } from './frame.mjs';
 import { rpcLogLine, decodeRpcHeader, rewriteRpcId, encodeRpcHeader } from './rpclog.mjs';
-import { spawnHost, handshake, resolveServerRoot } from './host.mjs';
+import { spawnHost, handshake, resolveServerRoot, ensureCliProviderConfig } from './host.mjs';
 import { LATEST_PAGE_URLS, parseVersionsFromPage, currentRendererVersion, currentServerAppVersion } from './upgrade.mjs';
 import { startLogin, stopLogin, loginState, credentialsPath } from './login.mjs';
 import { resolvePaths } from './dirs.mjs';
@@ -936,6 +936,10 @@ async function createSession(userKey, tabId) {
       if (session.closed) return;
       session.hello = hello;
       console.error('[zcode-webui] handshake ok pid=' + child.pid + ' host=' + hello.version);
+      // 3.12+ agent CLI needs the builtin provider catalog next to it; the host has just
+      // materialized its own copy, so hand it over before the first agent spawn
+      // (otherwise `zcode.cjs app-server` dies with "无法定位 CLI ZCode Built-in Provider Config")
+      ensureCliProviderConfig(serverRoot, { log: (l) => console.error(l) });
       // attach the stdout drain only after the handshake consumed the hello line —
       // otherwise the hello JSON would contaminate the frame parser's buffer
       parser.push(rest);
@@ -1557,6 +1561,9 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('[zcode-webui] workspace  : ' + WORKSPACE);
   console.log('[zcode-webui] serverRoot : ' + (serverRoot || '(missing)'));
   console.log('[zcode-webui] renderer   : ' + (existsSync(path.join(RENDERER_DIR, 'index.html')) ? 'ready' : 'MISSING (run: npm run fetch-renderer)'));
+  // self-heal the 3.12+ CLI provider catalog on every start (see ensureCliProviderConfig):
+  // covers runtime upgrades and a wiped ~/.zcode/v2 without waiting for the first session
+  if (serverRoot) ensureCliProviderConfig(serverRoot, { log: (l) => console.log(l) });
 });
 
 process.on('SIGTERM', shutdown);

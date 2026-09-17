@@ -184,6 +184,10 @@ Note: `upgrade` updates the official components only; upgrade zcode-webui itself
 > the right handshake per deployed renderer version (bare string for <=3.11, object + startup state for
 > >=3.12) and `SHIM_MAX_SUPPORTED` is 3.12.3.
 >
+> 3.12's `zcode.cjs` also needs `<runtime>/agents/glm/provider/zcode-builtin.json` (the desktop app
+> ships it, the server runtime does not) — without it both login and agent spawns fail; the server
+> materializes it from `~/.zcode/v2/runtime/provider/bundled/` on start and after each host handshake.
+>
 > Note: from 3.12 model availability is resolved server-side against the account entitlement. Without an
 > active plan (`billing/balance` returns `plans: []`) the UI shows "当前没有可用模型" — add your API key via
 > 管理模型 → 添加自定义模型, or `./zcode-update.sh --rollback` to return to 3.11.x (which trusts the local

@@ -94,6 +94,22 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
 `state` 连发两次躲开「监听器与 `__ZCODE_RENDERER_START__` 同一次模块执行」的竞态。
 协议桥本身没变（smoke 测试对 3.12 也是全绿），所以**必须靠 `scripts/ui-boot-check.mjs` 真跑浏览器**才看得出好坏。
 
+### 3.12.x 的 CLI 依赖：内置 provider 配置（关键）
+
+官方 3.12 的 `zcode.cjs` 启动时会解析「CLI ZCode Built-in Provider Config」，只认两处：
+
+1. `<runtime>/agents/glm/provider/zcode-builtin.json`（桌面端把它跟 CLI 一起打包，**服务器运行时组件不含**）
+2. `<entry 上溯 5 级的父目录>/config/provider/zcode-builtin.json`（本机解析成 `/home/config/...`，用不上）
+
+缺了这个文件，`zcode.cjs login` 与 `zcode.cjs app-server`（host 起 agent 用的入口）都会**直接退出**：
+`无法定位 CLI ZCode Built-in Provider Config：…`。换句话说 3.12 上登录做不了、agent 也起不来
+（协议往返类测试发现不了——continuity/smoke 都不跑 agent）。
+
+修法：`src/host.mjs` 的 `ensureCliProviderConfig()` 把 host 自己物化出来的
+`<dataRoot>/v2/runtime/provider/bundled/zcode-builtin.json` 复制到 CLI 期望的位置，
+只在该文件缺失时写（不覆盖官方自带的）。调用点两处：server 启动时、以及每次 host 握手成功后
+（agent 一定在握手之后才 spawn），所以换运行时、清 v2 目录都能自愈。
+
 ### 3.12.x 的模型可用性（不是 bug，是官方新行为）
 
 3.12 起模型可用性走**服务端 entitlement 校验**（provider 身份变成 `account:*`）：

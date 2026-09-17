@@ -167,6 +167,10 @@ zcode-webui upgrade --yes --restart    # 非交互，并在前后自动停/启�
 > startupId 对齐），否则界面停在「未能收到启动状态 / startup-channel-unavailable」。`web/bootstrap.js`
 > 现按渲染层版本自动二选一（<=3.11 裸字符串，>=3.12 对象+启动状态），`SHIM_MAX_SUPPORTED` 已提到 3.12.3。
 >
+> 3.12 的 `zcode.cjs` 还需要 `<runtime>/agents/glm/provider/zcode-builtin.json`（官方只随桌面端分发），
+> 缺了它登录和 agent 都起不来；server 启动与 host 握手后会自动从 `~/.zcode/v2/runtime/provider/bundled/`
+> 复制过去（`ensureCliProviderConfig`），无需手工处理。
+>
 > 注意：3.12 起**模型可用性改为服务端 entitlement 校验**。若账号没有有效套餐（billing/balance 返回
 > `plans: []`），界面会显示「当前没有可用模型」——用「管理模型 → 添加自定义模型」填本地 API key 即可，
 > 或 `./zcode-update.sh --rollback` 退回 3.11.x（那一版直接信任本机 CLI 配置里的 key）。
