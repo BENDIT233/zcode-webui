@@ -320,6 +320,11 @@ function readRendererIndex() {
     workspace: WORKSPACE,
     deviceId,
     serverRoot: serverRoot || null,
+    // The deployed official renderer version. web/bootstrap.js needs it to pick the
+    // right service-port handshake: >= 3.12 switches to an object message plus the
+    // 'zcode:database-startup-state' startup channel, 3.11 and older take the bare
+    // 'zcode:service-port' string.
+    rendererVersion: currentRendererVersion(RENDERER_DIR),
   }) + ';</script>';
   const bridgeScript = '<script src="./__zcode_webui/zcode-bridge.js' + assetVersion + '"></script>';
   const bootScript = '<script src="./__zcode_webui/bootstrap.js' + assetVersion + '"></script>';

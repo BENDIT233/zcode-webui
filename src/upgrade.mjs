@@ -38,16 +38,18 @@ export const CDN_BASE = 'https://cdn-zcode.z.ai/zcode/electron/releases';
 // Pinned fallback when the website cannot be reached. JS callers import this so
 // the default never drifts between modules; scripts/fetch-renderer.sh carries
 // the same value for standalone shell usage — keep the two in sync.
-export const DEFAULT_VERSION = '3.11.2';
+export const DEFAULT_VERSION = '3.12.3';
 
-// Highest official release this shim can actually drive. Official renderers >= 3.12
-// wait for a desktop "database startup" channel (window message
-// `zcode:database-startup-state` + MessagePort) that web/zcode-bridge.js does not
-// provide yet, so they boot into the "未能收到启动状态 / startup-channel-unavailable"
-// failure screen even though the protocol bridge works fine. cmdUpgrade refuses to
-// cross this line unless --force is given; zcode-update.sh instead verifies the UI
-// after installing and rolls back automatically.
-export const SHIM_MAX_SUPPORTED = '3.11.2';
+// Highest official release this shim is verified against. Official renderers >= 3.12
+// switched the service-port message to an object and additionally require the desktop
+// "database startup" channel (`zcode:database-startup-state`, phase=ready, startupId
+// matching the port's databaseStartupId) — implemented for both eras in
+// web/bootstrap.js. cmdUpgrade refuses to cross this line unless --force is given;
+// ./zcode-update.sh instead verifies the UI after installing and rolls back on failure.
+// NOTE for >= 3.12: model availability is resolved server-side against the account
+// entitlement, so an account without an active plan shows "当前没有可用模型" even though
+// everything else works (configure a provider/API key via 管理模型 in that case).
+export const SHIM_MAX_SUPPORTED = '3.12.3';
 
 // numeric dotted-version comparison: true when a is newer than b
 export function semverGt(a, b) {

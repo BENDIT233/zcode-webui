@@ -75,22 +75,46 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
 4. **强制校验**：版本对齐 → `/api/health` → `scripts/smoke-test.mjs`（WS/HTTP 协议桥）→
    `scripts/ui-boot-check.mjs`（headless Chromium 真跑官方渲染层）。任一失败，**默认自动回滚**并再校验一次
    （`--no-auto-rollback` 可关）。
-5. **shim 支持上限**：`SHIM_MAX_SUPPORTED`（脚本与 `src/upgrade.mjs` 各一份）默认 **3.11.2**，
-   超过它的版本不自动升，只提示。原因见下条。
+5. **shim 支持上限**：`SHIM_MAX_SUPPORTED`（脚本与 `src/upgrade.mjs` 各一份）为 **3.12.3**，
+   超过它的版本不自动升，只提示（显式 `-v` 可试装，装完照样校验界面）。
 
-### 3.12.x 暂不支持（重要）
+### 3.12.x 适配（2026-09-17 完成）
 
-官方 3.12.0 起的渲染层要求桌面端下发 `window` message `zcode:database-startup-state`
-（常量在渲染层 `assets/src-*.js`）+ 一个 MessagePort 的「数据库启动通道」，等不到就在 30 秒后渲染
-「未能收到启动状态 / 诊断 ID: startup-channel-unavailable」。协议桥（WS/HTTP）本身是好的，
-所以 **smoke 测试会全绿，只有真跑浏览器才看得出来**——这正是 `ui-boot-check.mjs` 存在的理由。
-要支持 3.12.x，必须按该协议补齐 `web/zcode-bridge.js` 的启动通道（含 state 校验与端口语义）。
+官方 3.12 起渲染层的启动条件变了，两处都要对上，否则界面停在「未能收到启动状态
+/ 诊断 ID: startup-channel-unavailable」：
 
-- 2026-09-17 实测：3.12.3 装上后界面停在上面的失败页 → 脚本自动回滚回 3.11.2。
-- `node src/cli.mjs upgrade` 已加同一道闸：目标版本 > `SHIM_MAX_SUPPORTED` 时直接拒绝（`--force` 可越）。
-- 因此本机部署的钉住版本仍是 **3.11.2**（`scripts/fetch-renderer.sh` 的 `ZCODE_VERSION` 默认值、
-  `src/upgrade.mjs` 的 `DEFAULT_VERSION`、`zcode-update.sh` 的 `PINNED_VERSION`，
-  三处 + README 里的默认值要一起改）。
+1. **服务端口消息改成对象**：`{type:'zcode:service-port', databaseStartupId}`（3.11 及更早只认裸字符串
+   `'zcode:service-port'`）。
+2. **必须再收到「数据库启动通道」状态**：`{type:'zcode:database-startup-state', state}`，其中
+   `state.phase === 'ready'` 且 `state.startupId === databaseStartupId`（schema 是 strict object：
+   schemaVersion/startupId/attemptId/sequence/startedAt/updatedAt/phase/disk 必填）。
+   桌面端主进程负责开库/迁移并上报进度；本项目里数据库由官方运行时自己管，所以直接报 ready。
+
+`web/bootstrap.js` 按 `cfg.rendererVersion`（server.mjs 注入）二选一，3.11 与 3.12 都能跑；
+`state` 连发两次躲开「监听器与 `__ZCODE_RENDERER_START__` 同一次模块执行」的竞态。
+协议桥本身没变（smoke 测试对 3.12 也是全绿），所以**必须靠 `scripts/ui-boot-check.mjs` 真跑浏览器**才看得出好坏。
+
+### 3.12.x 的模型可用性（不是 bug，是官方新行为）
+
+3.12 起模型可用性走**服务端 entitlement 校验**（provider 身份变成 `account:*`）：
+
+- 3.11.2：直接信任本机 `~/.zcode/cli/config.json` 里的 API key（日志 `codingPlanApiKey:builtin:...`），
+  所以界面能列出 GLM-5.3。
+- 3.12.3：先查 `https://zcode.z.ai/api/v1/zcode-plan/billing/balance`，本机账号返回
+  `plans: []`（`hasActiveStartPlan:false`）→ 日志 `[usage-stats] 读取 BigModel entitlement 未找到可用授权`
+  → 界面显示「当前没有可用模型。请开通编程套餐或配置自定义模型。」（模型列表为空）。
+
+**处理办法**：在界面「管理模型 → 添加自定义模型」里填本地 API key（官方给的路子），或续费/绑定套餐；
+想回到「认本地 key」的旧行为就 `./zcode-update.sh --rollback` 退回 3.11.2（备份已在，一条命令）。
+另外 3.12 渲染层还会请求 `window-controller` 通道（桌面端主进程服务，本项目不提供，日志里会刷
+`Unknown channel: window-controller`）——已确认不影响启动与协议往返。
+
+### 版本钉位
+
+- 本机部署：**3.12.3**（`zcode-update.sh` 的 `PINNED_VERSION`、`scripts/fetch-renderer.sh` 的
+  `ZCODE_VERSION` 默认值、`src/upgrade.mjs` 的 `DEFAULT_VERSION`、README 里的默认值，四处一起改）。
+- shim 支持上限：**3.12.3**（`SHIM_MAX_SUPPORTED`，两处：`zcode-update.sh` 与 `src/upgrade.mjs`）。
+  超过上限的版本默认不升，只提示；显式 `-v` 仍可试装，装完照常校验、起不来自动回滚。
 
 ## 其他约定
 

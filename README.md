@@ -49,7 +49,7 @@ git clone https://github.com/windviki/zcode-webui.git
 cd zcode-webui && npm install          # 运行时依赖只有 ws
 
 npm run fetch-renderer                 # 从官方 CDN 下载安装包并提取界面
-                                       # （默认 3.11.2，可用 ZCODE_VERSION=… ZCODE_ARCH=x64 覆盖）
+                                       # （默认 3.12.3，可用 ZCODE_VERSION=… ZCODE_ARCH=x64 覆盖）
 
 cp config.example.json config.json     # 可选；常用字段 workspace / oauthProxy / hostProxy
 
@@ -126,7 +126,7 @@ nginx 保留前缀转发即可（`proxy_pass http://127.0.0.1:3102;` 不带 URI 
 | `ZCODE_SERVER_RUNTIME_ROOT` | `serverRoot` | `~/.zcode/server` | 官方运行时目录（通常无需修改） |
 | `ZCODE_HOME` | — | `~/.zcode` | 官方数据/凭据目录（与官方 CLI 共用） |
 | `ZCODE_WEBUI_HOME` | — | 见右 | 本服务数据目录（config、渲染层、设备标识、日志）；npm 安装默认 `~/.zcode-webui`，git 部署且项目根已有 `config.json` 或 `vendor/renderer` 时沿用项目目录 |
-| `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.11.2` / `x64` | `fetch-renderer` 的下载版本与架构 |
+| `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.12.3` / `x64` | `fetch-renderer` 的下载版本与架构 |
 | `ZCODE_WEBUI_DETACHED_TTL_MS` | — | `1800000` | 后台会话脱离超过该时长且无任务运行、无帧活动时回收；`0` = 永不回收 |
 | `ZCODE_WEBUI_FRAME_QUIET_MS` | — | `600000` | 回收条件之一：最近该时长内无 host→浏览器帧 |
 | `ZCODE_WEBUI_RUNNING_TASK_STALE_MS` | — | `7200000` | 回收的全局保险：索引里有窗口内的 running 任务时不回收任何会话 |
@@ -162,10 +162,14 @@ zcode-webui upgrade --yes --restart    # 非交互，并在前后自动停/启�
 `--renderer-only` / `--server-only`、`--force`（同版本强制重装）、`--no-backup`。
 注意：`upgrade` 只升官方组件；zcode-webui 自身用 `npm update -g @aixyzstudio/zcode-webui` 升级。
 
-> 官方 **3.12.x** 的渲染层要求桌面端下发「数据库启动通道」（`zcode:database-startup-state`
-> + MessagePort），本项目 shim 尚未实现，装上会停在「未能收到启动状态
-> / startup-channel-unavailable」失败页。`upgrade` 会直接拒绝跨过 3.11.2（`--force` 可越），
-> 仓库内的 `./zcode-update.sh` 则在装完后真跑一次浏览器校验、起不来自动回滚。
+> **3.12.x 已适配**：官方 3.12 起服务端口消息改成 `{type:'zcode:service-port', databaseStartupId}`
+> 对象，并要求桌面端再下发「数据库启动通道」状态（`zcode:database-startup-state`，phase=ready 且
+> startupId 对齐），否则界面停在「未能收到启动状态 / startup-channel-unavailable」。`web/bootstrap.js`
+> 现按渲染层版本自动二选一（<=3.11 裸字符串，>=3.12 对象+启动状态），`SHIM_MAX_SUPPORTED` 已提到 3.12.3。
+>
+> 注意：3.12 起**模型可用性改为服务端 entitlement 校验**。若账号没有有效套餐（billing/balance 返回
+> `plans: []`），界面会显示「当前没有可用模型」——用「管理模型 → 添加自定义模型」填本地 API key 即可，
+> 或 `./zcode-update.sh --rollback` 退回 3.11.x（那一版直接信任本机 CLI 配置里的 key）。
 
 ### 仓库内一键更新（git 部署 / 本机）
 

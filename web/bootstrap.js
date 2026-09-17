@@ -207,6 +207,52 @@
     if (portQueue.length < 64) portQueue.push(u8);
   }
 
+  // The official renderer's service-port handshake changed in 3.12:
+  //   <= 3.11  window.postMessage('zcode:service-port', '*', [port])      (bare string)
+  //   >= 3.12  window.postMessage({type:'zcode:service-port',
+  //                                databaseStartupId}, '*', [port])       (object)
+  //            ...and the app only boots once it has ALSO received a
+  //            'zcode:database-startup-state' message whose state.phase === 'ready'
+  //            and state.startupId === message.databaseStartupId.
+  // In the desktop app the main process opens/migrates the local database and reports
+  // that progress; here the official runtime owns the database, so we simply report
+  // "ready". Without it 3.12+ renders its startup-failure screen
+  // ("未能收到启动状态" / startup-channel-unavailable) after 30s.
+  // The deployed renderer version arrives in cfg (src/server.mjs), so exactly one
+  // handshake is sent — never both, which would leak queued frames on the unused port.
+  function rendererAtLeast(major, minor) {
+    var parts = String((cfg && cfg.rendererVersion) || '').split('.');
+    if (parts.length < 2) return false;
+    var M = parseInt(parts[0], 10);
+    var m = parseInt(parts[1], 10);
+    if (isNaN(M) || isNaN(m)) return false;
+    return M > major || (M === major && m >= minor);
+  }
+
+  function postDatabaseStartupState(startupId) {
+    var now = Date.now();
+    var msg = {
+      type: 'zcode:database-startup-state',
+      state: {
+        schemaVersion: 1,
+        startupId: startupId,
+        attemptId: 'zcode-webui-startup',
+        sequence: 1,
+        startedAt: now,
+        updatedAt: now,
+        phase: 'ready',
+        databasePhase: 'ready',
+        disk: []
+      }
+    };
+    var send = function () { try { window.postMessage(msg, '*'); } catch (e) { /* ignore */ } };
+    send();
+    // the renderer registers its message listener in the same module execution that
+    // sets __ZCODE_RENDERER_START__, so re-send once to beat the race (duplicates are
+    // ignored by the renderer's startupId+sequence rule)
+    setTimeout(send, 500);
+  }
+
   function deliverPort() {
     if (delivered) {
       // hot reconnect: the renderer already has its port — tell the server to
@@ -232,7 +278,13 @@
           try { port2.postMessage(portQueue[q], [portQueue[q].buffer]); } catch (e) { /* ignore */ }
         }
         portQueue = [];
-        window.postMessage('zcode:service-port', '*', [channel.port1]);
+        if (rendererAtLeast(3, 12)) {
+          var startupId = 'zcode-webui-' + ((cfg && cfg.deviceId) || 'local') + '-' + Date.now().toString(36);
+          window.postMessage({ type: 'zcode:service-port', databaseStartupId: startupId }, '*', [channel.port1]);
+          postDatabaseStartupState(startupId);
+        } else {
+          window.postMessage('zcode:service-port', '*', [channel.port1]);
+        }
         everDelivered = true;
         // tell the backend this renderer is now wired: an ADOPTED mid-stream host
         // releases its ordered frame buffer on this signal

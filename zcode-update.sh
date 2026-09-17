@@ -24,11 +24,13 @@
 # 能否真正启动（ui-boot-check，headless Chromium）。任一项失败且存在备份时，默认自动
 # 回滚到更新前的版本并再校验一次，避免「协议通了、界面是坏的」这类升级事故。
 #
-# 已知不兼容（2026-09 记录）：官方 3.12.x 的渲染层要求桌面端下发
-# window message `zcode:database-startup-state` + MessagePort 的「数据库启动通道」，
-# 本项目 0.4.0 的 shim 未实现，升级后界面会停在「未能收到启动状态
-# / startup-channel-unavailable」。因此默认版本/兜底版本仍钉在 3.11.2（官网公布版）。
-# 要用 3.12.x 必须先按该协议补齐 web/zcode-bridge.js 的启动通道。
+# 3.12.x 适配（2026-09 完成）：官方 3.12 起服务端口消息改为
+# `{type:'zcode:service-port', databaseStartupId}` 对象，且渲染层必须再收到
+# `zcode:database-startup-state`（桌面端「数据库启动通道」，phase=ready 且 startupId 对齐）
+# 才会启动；否则 30 秒后停在「未能收到启动状态 / startup-channel-unavailable」。
+# web/bootstrap.js 按注入的渲染层版本二选一（<=3.11 裸字符串，>=3.12 对象+启动状态）。
+# 另注：3.12 起模型可用性改为服务端 entitlement 校验（account:*），若账号没有有效套餐，
+# 界面会显示「当前没有可用模型」——此时用「管理模型 → 添加自定义模型/API Key」接入本地 key。
 #
 # 环境变量: ZCODE_HTTP_PROXY（代理）、ZCODE_WEBUI_HOME（数据目录）、
 #           ZCODE_SERVER_RUNTIME_ROOT / ZCODE_HOME、ZCODE_ARCH=x64|arm64、
@@ -64,14 +66,13 @@ SITE_PAGES=(
 # 兜底版本（官网不可达时用）也是「已知可用」版本，不是最新版本：
 # 与 scripts/fetch-renderer.sh 的 ZCODE_VERSION 默认值、src/upgrade.mjs 的
 # DEFAULT_VERSION 保持一致。
-PINNED_VERSION="3.11.2"
+PINNED_VERSION="3.12.3"
 
 # shim 能驱动的最高官方版本（与 src/upgrade.mjs 的 SHIM_MAX_SUPPORTED 保持一致）。
-# 超过它的版本默认不升：官方 3.12.x 的渲染层要求桌面端下发
-# `zcode:database-startup-state` + MessagePort 的「数据库启动通道」，本项目 shim 未实现，
-# 装上会停在「未能收到启动状态 / startup-channel-unavailable」失败页。
-# 想试新版本可以显式 `-v 3.12.3`：那时走完整校验，界面起不来会自动回滚。
-SHIM_MAX_SUPPORTED="3.11.2"
+# 超过它的版本默认不升，只提示（显式 -v 可绕过，装完照样校验界面、起不来自动回滚）。
+# 3.12.x 已适配（启动通道 + 对象形式的服务端口消息，见 web/bootstrap.js），
+# 再往上的版本尚未验证，所以上限钉在 3.12.3。
+SHIM_MAX_SUPPORTED="3.12.3"
 
 DATA_HOME="${ZCODE_WEBUI_HOME:-$SCRIPT_DIR}"
 RENDERER_DIR="$DATA_HOME/vendor/renderer"

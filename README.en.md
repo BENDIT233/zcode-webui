@@ -57,7 +57,7 @@ git clone https://github.com/windviki/zcode-webui.git
 cd zcode-webui && npm install          # only runtime dependency: ws
 
 npm run fetch-renderer                 # downloads the official installer from the CDN and extracts
-                                       # the UI (default 3.11.2; override ZCODE_VERSION=… ZCODE_ARCH=x64)
+                                       # the UI (default 3.12.3; override ZCODE_VERSION=… ZCODE_ARCH=x64)
 
 cp config.example.json config.json     # optional; common fields: workspace / oauthProxy / hostProxy
 
@@ -138,7 +138,7 @@ Priority: CLI args ≈ env vars > `config.json` > defaults.
 | `ZCODE_SERVER_RUNTIME_ROOT` | `serverRoot` | `~/.zcode/server` | Official runtime directory (rarely changed) |
 | `ZCODE_HOME` | — | `~/.zcode` | Official data/credential directory (shared with the CLI) |
 | `ZCODE_WEBUI_HOME` | — | see notes | Data home of this service (config, renderer, device id, logs); defaults to `~/.zcode-webui` for npm installs; git checkouts keep using the project dir when it already contains `config.json` or `vendor/renderer` |
-| `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.11.2` / `x64` | Version/architecture for `fetch-renderer` |
+| `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.12.3` / `x64` | Version/architecture for `fetch-renderer` |
 | `ZCODE_WEBUI_DETACHED_TTL_MS` | — | `1800000` | Reap detached background hosts after this long when idle; `0` = keep forever |
 | `ZCODE_WEBUI_FRAME_QUIET_MS` | — | `600000` | Reap precondition: no host→browser frames within this window |
 | `ZCODE_WEBUI_RUNNING_TASK_STALE_MS` | — | `7200000` | Global reap guard: nothing is reaped while the task index has a recent "running" task |
@@ -177,11 +177,17 @@ Other flags: `--version X.Y.Z`, `--arch x64|arm64`, `--renderer-only` / `--serve
 Note: `upgrade` updates the official components only; upgrade zcode-webui itself with
 `npm update -g @aixyzstudio/zcode-webui`.
 
-> Official **3.12.x** renderers require a desktop "database startup" channel
-> (`zcode:database-startup-state` + a MessagePort) that this project's shim does not implement yet, so
-> they boot into the "未能收到启动状态 / startup-channel-unavailable" failure screen. `upgrade` refuses
-> to cross 3.11.2 (`--force` overrides); the repo-level `./zcode-update.sh` instead boots the page in
-> headless Chromium after installing and rolls the update back if the UI does not come up.
+> **3.12.x is supported**: official 3.12 switched the service-port message to an object
+> (`{type:'zcode:service-port', databaseStartupId}`) and additionally requires the desktop
+> "database startup" channel (`zcode:database-startup-state`, phase=ready, startupId matching the port),
+> otherwise the UI stops at "未能收到启动状态 / startup-channel-unavailable". `web/bootstrap.js` now picks
+> the right handshake per deployed renderer version (bare string for <=3.11, object + startup state for
+> >=3.12) and `SHIM_MAX_SUPPORTED` is 3.12.3.
+>
+> Note: from 3.12 model availability is resolved server-side against the account entitlement. Without an
+> active plan (`billing/balance` returns `plans: []`) the UI shows "当前没有可用模型" — add your API key via
+> 管理模型 → 添加自定义模型, or `./zcode-update.sh --rollback` to return to 3.11.x (which trusts the local
+> CLI config key instead).
 
 ### One-command update (git checkout / local deployment)
 
