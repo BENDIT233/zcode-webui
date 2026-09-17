@@ -110,10 +110,16 @@
       running = false;
     });
   });
+  // 已经登录时默认跳回应用；但「/login?force=1」（#relogin 亦可）要留在本页，
+  // 否则想换账号 / 重拉套餐时根本进不来（凭据还在，页面自己就把人弹走了）。
+  var FORCE = /(?:^|[?&])force=1(?:&|$)/.test(window.location.search) || window.location.hash === '#relogin';
   api('api/login/status').then(function (s) {
-    if (s.loggedIn) {
-      stateEl.textContent = '已登录，正在跳转…';
+    if (s.loggedIn && !FORCE) {
+      stateEl.textContent = '已登录，正在跳转…（想重新登录请访问 ./login?force=1）';
       setTimeout(function () { window.location.href = './'; }, 600);
+    } else if (s.loggedIn && FORCE) {
+      stateEl.textContent = '当前已有凭据。点「开始登录」可重新登录，成功后会用新凭据覆盖（换账号 / 重拉套餐就走这里）。';
+      btn.disabled = false;
     }
   });
 })();

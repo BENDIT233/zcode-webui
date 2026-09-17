@@ -18,6 +18,11 @@ const BASE = process.argv[2] || 'http://127.0.0.1:3102/';
 const SHOT = process.argv[3] || '';
 const TIMEOUT_MS = Number(process.env.ZCODE_UI_CHECK_TIMEOUT_MS || 45000);
 const MIN_PAINTED_HTML = 20000; // a real app shell is >100 KB of DOM; a spinner is <5 KB
+// Headless Chromium ignores the shell's HTTPS_PROXY (unlike curl), so on a box that
+// needs a proxy for egress the official renderer's own outbound calls fail with
+// ERR_EMPTY_RESPONSE and would be reported as page errors. Pass ZCODE_UI_CHECK_PROXY
+// (or fall back to HTTPS_PROXY) to route the browser the same way.
+const PROXY = (process.env.ZCODE_UI_CHECK_PROXY || process.env.HTTPS_PROXY || '').trim();
 
 let chromium;
 try {
@@ -29,7 +34,11 @@ try {
 
 let browser;
 try {
-  browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  browser = await chromium.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    ...(PROXY ? { proxy: { server: PROXY, bypass: 'localhost,127.0.0.1,::1' } } : {}),
+  });
 } catch (err) {
   console.log('SKIP  无法启动 Chromium: ' + String(err.message || err).slice(0, 200));
   process.exit(3);
