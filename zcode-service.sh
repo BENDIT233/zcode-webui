@@ -182,12 +182,16 @@ health() {
 
 logs() { tail -n "${1:-100}" -f "$LOG_FILE"; }
 
-case "${1:-}" in
-  start)    start ;;
-  stop)     stop ;;
-  restart)  restart ;;
-  status)   status ;;
-  health)   health ;;
-  logs)     logs "${2:-100}" ;;
-  *) echo "用法: $0 {start|stop|restart|status|health|logs [N]}"; exit 1 ;;
-esac
+# 只有被直接执行时才分发子命令；被 source 时（zcode-update.sh 复用端口解析、
+# 健康检查与启停函数）只导出上面的变量和函数。
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  case "${1:-}" in
+    start)    start ;;
+    stop)     stop ;;
+    restart)  restart ;;
+    status)   status ;;
+    health)   health ;;
+    logs)     logs "${2:-100}" ;;
+    *) echo "用法: $0 {start|stop|restart|status|health|logs [N]}"; exit 1 ;;
+  esac
+fi

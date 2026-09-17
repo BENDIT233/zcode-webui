@@ -49,7 +49,7 @@ git clone https://github.com/windviki/zcode-webui.git
 cd zcode-webui && npm install          # 运行时依赖只有 ws
 
 npm run fetch-renderer                 # 从官方 CDN 下载安装包并提取界面
-                                       # （默认 3.9.2，可用 ZCODE_VERSION=… ZCODE_ARCH=x64 覆盖）
+                                       # （默认 3.11.2，可用 ZCODE_VERSION=… ZCODE_ARCH=x64 覆盖）
 
 cp config.example.json config.json     # 可选；常用字段 workspace / oauthProxy / hostProxy
 
@@ -126,7 +126,7 @@ nginx 保留前缀转发即可（`proxy_pass http://127.0.0.1:3102;` 不带 URI 
 | `ZCODE_SERVER_RUNTIME_ROOT` | `serverRoot` | `~/.zcode/server` | 官方运行时目录（通常无需修改） |
 | `ZCODE_HOME` | — | `~/.zcode` | 官方数据/凭据目录（与官方 CLI 共用） |
 | `ZCODE_WEBUI_HOME` | — | 见右 | 本服务数据目录（config、渲染层、设备标识、日志）；npm 安装默认 `~/.zcode-webui`，git 部署且项目根已有 `config.json` 或 `vendor/renderer` 时沿用项目目录 |
-| `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.9.2` / `x64` | `fetch-renderer` 的下载版本与架构 |
+| `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.11.2` / `x64` | `fetch-renderer` 的下载版本与架构 |
 | `ZCODE_WEBUI_DETACHED_TTL_MS` | — | `1800000` | 后台会话脱离超过该时长且无任务运行、无帧活动时回收；`0` = 永不回收 |
 | `ZCODE_WEBUI_FRAME_QUIET_MS` | — | `600000` | 回收条件之一：最近该时长内无 host→浏览器帧 |
 | `ZCODE_WEBUI_RUNNING_TASK_STALE_MS` | — | `7200000` | 回收的全局保险：索引里有窗口内的 running 任务时不回收任何会话 |
@@ -161,6 +161,29 @@ zcode-webui upgrade --yes --restart    # 非交互，并在前后自动停/启�
 （`--yes` 跳过询问但不停止）。其它参数：`--version X.Y.Z`（指定版本）、`--arch x64|arm64`、
 `--renderer-only` / `--server-only`、`--force`（同版本强制重装）、`--no-backup`。
 注意：`upgrade` 只升官方组件；zcode-webui 自身用 `npm update -g @aixyzstudio/zcode-webui` 升级。
+
+> 官方 **3.12.x** 的渲染层要求桌面端下发「数据库启动通道」（`zcode:database-startup-state`
+> + MessagePort），本项目 shim 尚未实现，装上会停在「未能收到启动状态
+> / startup-channel-unavailable」失败页。`upgrade` 会直接拒绝跨过 3.11.2（`--force` 可越），
+> 仓库内的 `./zcode-update.sh` 则在装完后真跑一次浏览器校验、起不来自动回滚。
+
+### 仓库内一键更新（git 部署 / 本机）
+
+```bash
+./zcode-update.sh              # 探测最新版本 → 拉包解包 → 原子替换 → 重启 → 校验（失败自动回滚）
+./zcode-update.sh --check      # 只看当前 / 官网 / CDN 版本
+./zcode-update.sh -v 3.12.3    # 指定版本
+./zcode-update.sh --rollback   # 回滚到最近一次更新前的备份
+```
+
+与 `zcode-webui upgrade` 部署的东西完全一致（同一 CDN、同一组件清单、同样的
+`~/.zcode/server` 布局与 `.asset-components` 标记），差别是纯 shell 实现 + 更严的校验：
+
+1. 版本以 **CDN 为准**（官网页面常慢一步）：先读官网当基线，再探测 CDN 上真实存在（manifest + deb 都在）的最高版本；
+2. 动服务之前先做**资源预检**（.deb / 全部组件 HEAD 一遍），避免升到一半 404；
+3. 渲染层与运行时都在暂存目录组装、校验通过后才 `mv` 就位，旧版本各留 2 份备份；
+4. 装完依次校验版本对齐、`/api/health`、`scripts/smoke-test.mjs`（WS/HTTP 协议桥）、
+   `scripts/ui-boot-check.mjs`（headless Chromium 真跑渲染层）——任一项失败**自动回滚**。
 
 ## 官方 CLI 直连（可选）
 

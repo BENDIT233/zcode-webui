@@ -3,6 +3,10 @@ node_modules/
 
 # official renderer assets (fetched at deploy time with scripts/fetch-renderer.sh)
 vendor/renderer/
+# ...plus the pre-update renderer backups kept by zcode-update.sh / fetch-renderer.sh
+# (vendor/renderer.bak-<version>-<ts>, vendor/renderer.replaced-<ts>)
+vendor/renderer.bak-*
+vendor/renderer.replaced-*
 
 # runtime state / local secrets
 config.json
@@ -11,6 +15,10 @@ tmp/
 
 # fetch script workdir
 .fetch-tmp/
+.fetch-tmp.*/
+
+# update staging (component manifests, staged runtime, UI-check screenshot)
+.upgrade-tmp/
 
 # logs, screenshots, OS files
 *.log

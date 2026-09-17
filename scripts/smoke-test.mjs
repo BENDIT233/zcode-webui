@@ -134,6 +134,12 @@ wsResult.log.slice(0, 14).forEach((l) => console.log('       ' + l));
 // Each attempt opens its own host pipe; right after a heavy first-boot install a
 // freshly spawned host occasionally answers slowly or oddly, so a failed attempt
 // is retried as a brand-new pipe (every payload gets logged for diagnosis).
+//
+// The request is only sent AFTER the host's Initialize frame has been polled —
+// exactly what the real renderer does (web/bootstrap.js only ever speaks in
+// response to a delivered frame). Official runtimes >= 3.12 drop inbound messages
+// that arrive before their Initialize, so a request fired straight after
+// /bridge/open is never answered (3.11 and older tolerated it).
 async function httpBridgeAttempt(attempt) {
   const log = [];
   const open = await fetch(origin + base + '/bridge/open', { method: 'POST' }).then((r) => r.json());
@@ -142,16 +148,15 @@ async function httpBridgeAttempt(attempt) {
   const id = open.id;
   try {
     const req = message([100, 1, 'system', 'info'], undefined);
-    const sendResp = await fetch(origin + base + '/bridge/send?id=' + id, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: req }).then((r) => r.json());
-    log.push('send: ' + JSON.stringify(sendResp));
-    if (!sendResp.ok) return { ok: false, log, reason: 'send failed' };
     // Empty polls long-poll server-side (~25 s); self-pace on a deadline.
     const deadline = Date.now() + 30000;
     let bytesSeen = 0;
+    let sent = false;
     while (Date.now() < deadline) {
       const pollResp = await fetch(origin + base + '/bridge/poll?id=' + id);
       const buf = Buffer.from(await pollResp.arrayBuffer());
       bytesSeen += buf.length;
+      const frames = [];
       let off = 0;
       while (off + 4 <= buf.length) {
         const len = buf.readUInt32BE(off);
@@ -159,12 +164,22 @@ async function httpBridgeAttempt(attempt) {
         if (len === 0 || off + len > buf.length) break;
         const payload = buf.subarray(off, off + len);
         off += len;
+        frames.push(payload);
         if (payload.includes(Buffer.from('homedir'))) return { ok: true, log };
         log.push('payload ' + payload.length + 'B hex=' + payload.toString('hex').slice(0, 24) +
           ' utf8=' + JSON.stringify(payload.toString('utf8').slice(0, 120)));
       }
+      if (!sent && frames.some((p) => p.toString('hex') === '040106c80100')) {
+        const sendResp = await fetch(origin + base + '/bridge/send?id=' + id, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: req }).then((r) => r.json());
+        log.push('send (after Initialize): ' + JSON.stringify(sendResp));
+        if (!sendResp.ok) return { ok: false, log, reason: 'send failed' };
+        sent = true;
+      }
     }
-    return { ok: false, log, reason: 'no homedir frame in poll responses (' + bytesSeen + 'B)' };
+    return {
+      ok: false, log,
+      reason: (sent ? 'no homedir frame' : 'no Initialize frame') + ' in poll responses (' + bytesSeen + 'B)',
+    };
   } finally {
     await fetch(origin + base + '/bridge/close?id=' + id, { method: 'POST' }).catch(() => {});
   }

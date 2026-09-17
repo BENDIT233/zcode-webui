@@ -13,6 +13,7 @@ import { resolvePaths } from './dirs.mjs';
 import { resolveServerRoot } from './host.mjs';
 import {
   DEFAULT_VERSION,
+  SHIM_MAX_SUPPORTED,
   currentRendererVersion,
   currentServerAppVersion,
   fetchLatestVersion,
@@ -20,6 +21,7 @@ import {
   platformKey,
   resolveUpgradeProxy,
   runFetchRenderer,
+  semverGt,
 } from './upgrade.mjs';
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -538,6 +540,18 @@ async function cmdUpgrade() {
   let platform;
   try { platform = platformKey(arch); } catch (e) { fail(e.message); process.exit(2); }
   log('目标版本: v' + version + ' (' + platform + '，来源: ' + source + ')');
+
+  // Refuse to install an official release this shim cannot render (see
+  // SHIM_MAX_SUPPORTED in src/upgrade.mjs). --force is the escape hatch, and
+  // ./zcode-update.sh verifies the UI afterwards and rolls back on failure.
+  if (semverGt(version, SHIM_MAX_SUPPORTED)) {
+    if (!force) {
+      fail('v' + version + ' 的官方渲染层需要桌面端「数据库启动通道」（shim 尚未实现），装上会停在启动失败页');
+      log('  web/zcode-bridge.js 目前最高支持 v' + SHIM_MAX_SUPPORTED + '；确认要装可加 --force');
+      process.exit(3);
+    }
+    warn('v' + version + ' 超出 shim 支持范围（最高 v' + SHIM_MAX_SUPPORTED + '），--force 已确认，界面可能无法启动');
+  }
 
   // 2. current state vs target
   const serverRoot = serverRootTarget();

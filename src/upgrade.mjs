@@ -38,7 +38,27 @@ export const CDN_BASE = 'https://cdn-zcode.z.ai/zcode/electron/releases';
 // Pinned fallback when the website cannot be reached. JS callers import this so
 // the default never drifts between modules; scripts/fetch-renderer.sh carries
 // the same value for standalone shell usage — keep the two in sync.
-export const DEFAULT_VERSION = '3.9.2';
+export const DEFAULT_VERSION = '3.11.2';
+
+// Highest official release this shim can actually drive. Official renderers >= 3.12
+// wait for a desktop "database startup" channel (window message
+// `zcode:database-startup-state` + MessagePort) that web/zcode-bridge.js does not
+// provide yet, so they boot into the "未能收到启动状态 / startup-channel-unavailable"
+// failure screen even though the protocol bridge works fine. cmdUpgrade refuses to
+// cross this line unless --force is given; zcode-update.sh instead verifies the UI
+// after installing and rolls back automatically.
+export const SHIM_MAX_SUPPORTED = '3.11.2';
+
+// numeric dotted-version comparison: true when a is newer than b
+export function semverGt(a, b) {
+  const pa = String(a).replace(/^v/, '').split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = String(b).replace(/^v/, '').split('.').map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) > (pb[i] || 0)) return true;
+    if ((pa[i] || 0) < (pb[i] || 0)) return false;
+  }
+  return false;
+}
 
 export const LATEST_PAGE_URLS = [
   'https://zcode.z.ai/cn/changelog',

@@ -57,7 +57,7 @@ git clone https://github.com/windviki/zcode-webui.git
 cd zcode-webui && npm install          # only runtime dependency: ws
 
 npm run fetch-renderer                 # downloads the official installer from the CDN and extracts
-                                       # the UI (default 3.9.2; override ZCODE_VERSION=… ZCODE_ARCH=x64)
+                                       # the UI (default 3.11.2; override ZCODE_VERSION=… ZCODE_ARCH=x64)
 
 cp config.example.json config.json     # optional; common fields: workspace / oauthProxy / hostProxy
 
@@ -138,7 +138,7 @@ Priority: CLI args ≈ env vars > `config.json` > defaults.
 | `ZCODE_SERVER_RUNTIME_ROOT` | `serverRoot` | `~/.zcode/server` | Official runtime directory (rarely changed) |
 | `ZCODE_HOME` | — | `~/.zcode` | Official data/credential directory (shared with the CLI) |
 | `ZCODE_WEBUI_HOME` | — | see notes | Data home of this service (config, renderer, device id, logs); defaults to `~/.zcode-webui` for npm installs; git checkouts keep using the project dir when it already contains `config.json` or `vendor/renderer` |
-| `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.9.2` / `x64` | Version/architecture for `fetch-renderer` |
+| `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.11.2` / `x64` | Version/architecture for `fetch-renderer` |
 | `ZCODE_WEBUI_DETACHED_TTL_MS` | — | `1800000` | Reap detached background hosts after this long when idle; `0` = keep forever |
 | `ZCODE_WEBUI_FRAME_QUIET_MS` | — | `600000` | Reap precondition: no host→browser frames within this window |
 | `ZCODE_WEBUI_RUNNING_TASK_STALE_MS` | — | `7200000` | Global reap guard: nothing is reaped while the task index has a recent "running" task |
@@ -176,6 +176,34 @@ Other flags: `--version X.Y.Z`, `--arch x64|arm64`, `--renderer-only` / `--serve
 `--force` (reinstall even when current), `--no-backup`.
 Note: `upgrade` updates the official components only; upgrade zcode-webui itself with
 `npm update -g @aixyzstudio/zcode-webui`.
+
+> Official **3.12.x** renderers require a desktop "database startup" channel
+> (`zcode:database-startup-state` + a MessagePort) that this project's shim does not implement yet, so
+> they boot into the "未能收到启动状态 / startup-channel-unavailable" failure screen. `upgrade` refuses
+> to cross 3.11.2 (`--force` overrides); the repo-level `./zcode-update.sh` instead boots the page in
+> headless Chromium after installing and rolls the update back if the UI does not come up.
+
+### One-command update (git checkout / local deployment)
+
+```bash
+./zcode-update.sh              # detect → download → unpack → atomic swap → restart → verify (auto-rollback)
+./zcode-update.sh --check      # show current / website / CDN versions only
+./zcode-update.sh -v 3.12.3    # pin a version
+./zcode-update.sh --rollback   # restore the most recent pre-update backups
+```
+
+It deploys exactly the same artifacts as `zcode-webui upgrade` (same CDN, same component manifest, same
+`~/.zcode/server` layout and `.asset-components` markers) but is pure shell and verifies harder:
+
+1. versions come from the **CDN** (the website lags): the website version is the baseline, then the CDN is
+   probed for the highest version that really exists (manifest + deb);
+2. a **preflight** HEADs every artifact before the service is touched, so a half-published release cannot
+   fail mid-upgrade;
+3. renderer and runtime are assembled in a staging dir and only `mv`-ed into place after validation, with
+   the previous two versions kept as backups;
+4. after installing it checks version alignment, `/api/health`, `scripts/smoke-test.mjs` (WS/HTTP protocol
+   bridge) and `scripts/ui-boot-check.mjs` (the real renderer in headless Chromium) — any failure triggers
+   an **automatic rollback**.
 
 ## Official CLI headless usage (optional)
 
