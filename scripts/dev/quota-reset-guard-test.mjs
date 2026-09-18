@@ -2,6 +2,19 @@
 // the module is loaded against a mock globalThis.fetch and a temp stats dir.
 //
 //   node scripts/dev/quota-reset-guard-test.mjs
+//
+// When the shell itself runs under the 0.7.0+ host, NODE_OPTIONS preloads the
+// guard at process start; the test's mock would then replace the (already
+// wrapped) fetch and observe nothing. Re-exec once with the guard stripped.
+if (process.env.NODE_OPTIONS && process.env.NODE_OPTIONS.includes('quota-reset-guard')) {
+  const { spawnSync } = await import('node:child_process');
+  const clean = process.env.NODE_OPTIONS.split(/\s+/).filter((p) => !p.includes('quota-reset-guard')).join(' ');
+  const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url)], {
+    env: { ...process.env, NODE_OPTIONS: clean }, stdio: 'inherit',
+  });
+  process.exit(r.status ?? 1);
+}
+
 import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -54,6 +67,9 @@ globalThis.fetch = async (input, init) => {
         plans: [], server_time: Math.floor(Date.now() / 1000),
       },
     });
+  }
+  if (url.includes('/api/monitor/usage/quota/limit')) {
+    return jsonResponse({ code: 0, data: { level: 'max', limits: upstream.limits || [] } });
   }
   if (url.includes('/chat/completions')) {
     return new Response('{"error":"payment required"}', { status: 402 });
@@ -147,6 +163,19 @@ check('402 model response appends an exhaustion signal', existsSync(signalFile) 
 const passthrough = await globalThis.fetch('https://example.com/none');
 check('unrelated traffic passes through untouched', passthrough.ok && (await passthrough.json()).code === 0);
 
+// coding-plan pools come from /api/monitor/usage/quota/limit → data.limits[]
+upstream.limits = [
+  { type: 'TIME_LIMIT', number: 100, usage: 96, remaining: 4, nextResetTime: Math.floor((now + 2 * H) / 1000) },
+  { type: 'WEEK_LIMIT', number: 500, usage: 480, remaining: 20, nextResetTime: Math.floor((now + 3 * 86400_000) / 1000) },
+];
+await globalThis.fetch('https://api.z.ai/api/monitor/usage/quota/limit', { headers: { Authorization: 'Bearer zj5', 'X-Bigmodel-Authorization': 'Bearer pj5' } });
+check('quota/limit 5h pool parsed (window-classified)', S.buckets.FIVE_HOUR && S.buckets.FIVE_HOUR.remaining === 4 && S.buckets.FIVE_HOUR.src === 'limit');
+check('quota/limit week pool parsed (type-matched)', S.buckets.WEEK && S.buckets.WEEK.remaining === 20);
+// limits[] outrank subsequent balance heuristics for the same kind
+upstream.balances = [{ show_name: '', total_units: 10, used_units: 1, remaining_units: 9, expires_at: Math.floor((now + 30 * 60_000) / 1000) }];
+await globalThis.fetch('https://zcode.z.ai/api/v1/zcode-plan/billing/balance', { headers: { Authorization: 'Bearer zj6', 'X-Bigmodel-Authorization': 'Bearer pj6' } });
+check('fresh limits[] entry not displaced by balance heuristics', S.buckets.FIVE_HOUR.remaining === 4 && S.buckets.FIVE_HOUR.src === 'limit');
+
 // ---------- 3. executor: header replay + idempotency + confirmation ----------
 calls.length = 0;
 upstream.status.fiveHour = [now + 5 * H];
@@ -160,7 +189,7 @@ const useBody = JSON.parse(useCalls[useCalls.length - 1].body);
 check('idempotency key is a ≤64-char uuid', /^[0-9a-f-]{36}$/.test(useBody.idempotency_key) && useBody.idempotency_key.length <= 64);
 check('reset_type relayed', useBody.reset_type === 'FIVE_HOUR');
 const uh = useCalls[useCalls.length - 1].headers;
-check('auth headers replayed for /use', uh.Authorization === 'Bearer zj4' && uh['X-Bigmodel-Authorization'] === 'Bearer pj4' && uh['Bigmodel-Target-Type'] === 'PERSONAL');
+check('auth headers replayed for /use (latest captured pair)', uh.Authorization === 'Bearer zj6' && uh['X-Bigmodel-Authorization'] === 'Bearer pj6' && uh['Bigmodel-Target-Type'] === 'PERSONAL');
 check('content-type json on /use', (uh['content-type'] || uh['Content-Type'] || '').includes('application/json'));
 check('use accepted', result.ok === true);
 

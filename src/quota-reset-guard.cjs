@@ -253,6 +253,35 @@ async function observeResponse(url, res) {
     // a fresh status after a use is the confirmation the engine waits for
     if (S.lastUsedAt && S.status.at > S.lastUsedAt) S.confirmed = true;
   }
+  // coding-plan pools: GET /api/monitor/usage/quota/limit → data.limits[] with
+  // {type, number(total), usage, remaining, nextResetTime} — nextResetTime rolls
+  // in ≤6h for the 5h pool and ≤7d for the weekly one, which is the classifier.
+  // limits carry explicit types and outrank the balance heuristics below.
+  if (Array.isArray(data.limits)) {
+    STATS.balanceObservations++;
+    const now = Date.now();
+    if (!S.buckets) S.buckets = { at: 0 };
+    for (const L of data.limits) {
+      if (!L || typeof L.type !== 'string') continue;
+      const total = num(L.number);
+      let remaining = num(L.remaining);
+      if (remaining === null && total !== null && num(L.usage) !== null) remaining = Math.max(0, total - num(L.usage));
+      if (total === null || remaining === null) continue;
+      const nextRaw = num(L.nextResetTime);
+      const nextMs = nextRaw === null ? null : nextRaw * (nextRaw > 1e11 ? 1 : 1000);
+      let kind = null;
+      if (/five|5h|hour/i.test(L.type)) kind = 'FIVE_HOUR';
+      else if (/week|周/i.test(L.type)) kind = 'WEEK';
+      else if (nextMs !== null) {
+        const win = nextMs - now;
+        if (win > 0 && win <= 6 * 3600_000) kind = 'FIVE_HOUR';
+        else if (win > 6 * 3600_000 && win <= 8 * 86400_000) kind = 'WEEK';
+      }
+      if (!kind) continue;
+      S.buckets[kind] = { total, remaining, expiresAt: nextMs, showName: 'limit:' + L.type, src: 'limit', at: now };
+    }
+    S.buckets.at = now;
+  }
   if (Array.isArray(data.balances)) {
     STATS.balanceObservations++;
     const now = Date.now();
@@ -264,7 +293,9 @@ async function observeResponse(url, res) {
       if (!kind) return;
       const total = num(b.total_units), remaining = num(b.remaining_units);
       if (total === null || remaining === null) return;
-      const fields = { total, remaining, expiresAt: num(b.expires_at), showName: typeof b.show_name === 'string' ? b.show_name : '' };
+      const expRaw = num(b.expires_at);
+      const expMs = expRaw === null ? null : expRaw * (expRaw > 1e11 ? 1 : 1000);
+      const fields = { total, remaining, expiresAt: expMs, showName: typeof b.show_name === 'string' ? b.show_name : '' };
       const prev = picked[kind];
       if (!prev) { picked[kind] = { ...fields, named }; return; }
       if (prev.named && !named) return;   // a named bucket outranks a heuristic one
@@ -274,8 +305,11 @@ async function observeResponse(url, res) {
     for (const b of data.balances) consider(b, false);
     if (!S.buckets) S.buckets = { at: 0 };
     for (const [kind, fields] of Object.entries(picked)) {
+      const existing = S.buckets[kind];
+      // a fresh limits[] entry (explicit type) is only displaced by newer limits data
+      if (existing && existing.src === 'limit' && now - (existing.at || 0) <= 30 * 60_000) continue;
       const { named: _drop, ...rest } = fields;
-      S.buckets[kind] = rest;
+      S.buckets[kind] = { ...rest, src: 'balance', at: now };
     }
     S.buckets.at = now;
   }
