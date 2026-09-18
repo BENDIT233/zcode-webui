@@ -132,6 +132,27 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
 - shim 支持上限：**3.12.3**（`SHIM_MAX_SUPPORTED`，两处：`zcode-update.sh` 与 `src/upgrade.mjs`）。
   超过上限的版本默认不升，只提示；显式 `-v` 仍可试装，装完照常校验、起不来自动回滚。
 
+### 会话置顶（pin）禁用（2026-09-18）
+
+官方渲染层把置顶会话移进「已置顶」分组，宿主侧也从 `listTasks` 里剔除（走 `listPinnedTasks`/
+`listPinnedTaskIds`），而本项目只渲染普通列表 —— 误点行内那个 hover 才出现的置顶小图标，会话就从
+任务列表里彻底消失。现在置顶按钮被禁用，置顶请求直接吞掉（不落库）：
+
+- `web/zcode-bridge.js`：注入 `#__zcode_webui_pin_kill` 样式隐藏行内按钮与「更多」菜单项，
+  并在捕获阶段拦掉 click/mousedown/mouseup/focusin（老标签页 / 合成点击也打不通）。
+- `src/pin.mjs`：宿主侧 no-op 守卫，**两台传输都要过**——WS（`writeToHost`）与 HTTP 长轮询
+  （`/bridge/send`，这条以前绕过了守卫，是 pins 仍然落库的真正原因）。命中时日志
+  `[bridge] pin no-op (…)`，并本地伪造 201 给渲染层；`pinned:false` 一律放行，方便恢复。
+- **线上通道名是 `zcode-task`**（渲染层的 `ServiceChannels.ZCodeTask`），本地服务对象只是**叫**
+  `zcodeTaskService`，按那个名字匹配永远不命中（旧实现就是这么失效的）。参数按宿主约定包成
+  单元素数组 `[{taskId, workspacePath, pinned}]`（宿主是 `handler.apply(ctx, arg)`）。
+- 恢复置顶造成的“会话消失”：`node scripts/dev/unpin-tasks.mjs 3102 <workspacePath> <taskId…>`
+  （先 `listPinnedTaskIds` 打印现状，再逐个解置顶，全程走官方 RPC，不直接改库）。
+- 自检：`node scripts/dev/pin-guard-test.mjs`（守卫单测）、
+  `node scripts/dev/pin-relay-probe.mjs <port> <taskId> <workspacePath> 1`（HTTP 传输必须 201 假响应）、
+  `node scripts/dev/pin-kill-verify.mjs`（真浏览器里确认无可见置顶控件）。
+- 注意：守卫是**服务端代码**，改动后要重启服务才生效（客户端 CSS 部分刷新页面即可）。
+
 ## 其他约定
 
 - 提交信息风格：`feat:` / `fix:` / `chore:` 前缀，正文写动机和要点（参考 `git log`）。

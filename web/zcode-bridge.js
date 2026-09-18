@@ -287,6 +287,73 @@
     });
   }
 
+  // ---- pin (置顶) kill switch ----
+  // The official renderer moves a pinned task into the "已置顶" group, and the
+  // host serves pinned tasks from a separate listPinnedTasks/listPinnedTaskIds
+  // bucket — so a stray click on the tiny hover-only pin icon right next to the
+  // row makes the session disappear from the task list. The web shell renders
+  // the normal list only, so the control is removed from the UI outright.
+  //
+  // Two layers here, and a third on the server (src/pin.mjs, applied by
+  // writeToHost and the /bridge/send relay):
+  //   1. CSS hides both the row control and the "更多" popover item, so there is
+  //      nothing to mis-click and nothing to focus from the keyboard;
+  //   2. a capture-phase shield swallows click/mousedown/mouseup/focusin on any
+  //      surviving pin control, so even a synthetic or stale-tab click cannot
+  //      reach the renderer's handler and send the RPC.
+  // A pinned row that predates the fix is un-pinned on the data side instead
+  // (scripts/dev/unpin-tasks.mjs), because the renderer's task service is built
+  // internally and is not reachable from this shim.
+  var PIN_LABELS = [
+    '\u7f6e\u9876\u4efb\u52a1',           // 置顶任务 (taskList.pin)
+    '\u53d6\u6d88\u7f6e\u9876\u4efb\u52a1',  // 取消置顶任务 (taskList.unpin)
+    'Pin task', 'Unpin task'
+  ];
+  function isPinControl(el) {
+    if (!el || el.nodeType !== 1) return false;
+    var label = el.getAttribute && el.getAttribute('aria-label');
+    if (label && PIN_LABELS.indexOf(label.trim()) >= 0) return true;
+    if (el.getAttribute && el.getAttribute('data-testid') === 'pin-button') return true;
+    var txt = (el.textContent || '').trim();
+    for (var i = 0; i < PIN_LABELS.length; i++) if (txt === PIN_LABELS[i]) return true;
+    return false;
+  }
+  // Built from the renderer's own aria-labels: the row control carries one, and
+  // the popover item carries the same label plus the menu text.
+  var PIN_CSS = PIN_LABELS.map(function (l) {
+    return '[aria-label="' + l.replace(/"/g, '\\"') + '"]';
+  }).join(',') + ',[data-testid="pin-button"]';
+  var PIN_STYLE = PIN_CSS + '{display:none !important;pointer-events:none !important;}';
+
+  function installPinKillSwitch() {
+    try {
+      var st = document.createElement('style');
+      st.id = '__zcode_webui_pin_kill';
+      st.textContent = PIN_STYLE;
+      (document.head || document.documentElement).appendChild(st);
+
+      // kill clicks during the CAPTURE phase: the control's own mousedown
+      // preventDefault/stopPropagation must not be relied on once we hide it
+      function shield(ev) {
+        var t = ev.target;
+        var el = t && t.closest ? t.closest(PIN_CSS + ',[data-task-row-actions]') : null;
+        if (!el || !isPinControl(el)) return;
+        try { ev.preventDefault(); } catch (e) { /* ignore */ }
+        try { ev.stopImmediatePropagation(); } catch (e) { /* ignore */ }
+      }
+      document.addEventListener('click', shield, true);
+      document.addEventListener('mousedown', shield, true);
+      document.addEventListener('mouseup', shield, true);
+      // touch devices fire focus on the tiny control before the (mis)tap lands
+      document.addEventListener('focusin', function (ev) {
+        var el = ev.target;
+        if (!el || !isPinControl(el)) return;
+        try { el.blur(); } catch (e) { /* ignore */ }
+      }, true);
+    } catch (e) { /* never break the app shell over a UI patch */ }
+  }
+  installPinKillSwitch();
+
   function noop() {}
   function ok() { return Promise.resolve(undefined); }
   function unsub() { return function () {}; }

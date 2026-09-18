@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { encodeFrame, FrameParser } from './frame.mjs';
 import { rpcLogLine, decodeRpcHeader, rewriteRpcId, encodeRpcHeader } from './rpclog.mjs';
+import { interceptPinRpc, pinAckFor } from './pin.mjs';
 import { spawnHost, handshake, resolveServerRoot, ensureCliProviderConfig } from './host.mjs';
 import { LATEST_PAGE_URLS, parseVersionsFromPage, currentRendererVersion, currentServerAppVersion } from './upgrade.mjs';
 import { startLogin, stopLogin, loginState, credentialsPath } from './login.mjs';
@@ -646,6 +647,20 @@ async function openHostPipe() {
 const sessions = new Map();       // userKey -> session
 const httpRelays = new Map();     // id -> {pipe, queue, waiter, waiterTimer, lastSeen} (HTTP long-poll fallback)
 
+// hand one server-synthesised payload to the next /bridge/poll of a relay,
+// mirroring what pipe.onFrame does for host frames
+function queueRelayFrame(entry, payload) {
+  if (entry.waiter) {
+    const w = entry.waiter;
+    entry.waiter = null;
+    clearTimeout(entry.waiterTimer);
+    w(payload);
+  } else {
+    entry.queue.push(payload);
+    if (entry.queue.length > 256) entry.queue.shift();
+  }
+}
+
 function rpcLogOut(payload) {
   const l = rpcLogLine('RPC-out', payload);
   if (l) console.error('[rpc] ' + l);
@@ -665,6 +680,15 @@ function makeMux() {
   return { next: 0x10000, pending: new Map(), events: new Map(), dropped: 0 };
 }
 
+// Pin is broken in the official renderer: a pinned session is moved into the
+// "已置顶" group, which this web shell does not render next to the workspace
+// list, so one stray click on the hover-only pin icon makes the session vanish
+// from the task list. Pinning calls are answered with a synthetic success so the
+// host-side pinned flag never flips; un-pin calls still go through, so a session
+// that is pinned anyway can be restored from the UI. The guard lives in
+// src/pin.mjs and is applied on BOTH transports — the WS path below and the
+// HTTP long-poll relay (/bridge/send), which pushes straight into its own host
+// pipe and would otherwise bypass this function.
 function writeToHost(session, view, payload) {
   if (session.closed) return false;
   session.framesIn++;
@@ -675,18 +699,13 @@ function writeToHost(session, view, payload) {
     return true;
   }
   if (process.env.ZCODE_WEBUI_DEBUG_RPC === '1') rpcLogIn(payload);
-  // Pin is broken in the official renderer (a pinned session disappears from
-  // the task list). Swallow setTaskPinned and ack it locally so the host-side
-  // pinned flag never flips; the button becomes a harmless no-op.
   {
-    const hdr = decodeRpcHeader(payload);
-    if (hdr && hdr.type === 100 && hdr.channel === 'zcodeTaskService' && hdr.method === 'setTaskPinned') {
-      const ackId = session.mux ? ++session.mux.next : hdr.id;
-      const ack = Buffer.concat([
-        encodeRpcHeader([201, ackId, hdr.channel, hdr.method]),
-        Buffer.from([0]),                     // body: preset 0 (undefined)
-      ]);
-      if (session.mux) sendToView(session, { view, origId: hdr.id }, { id: ackId }, ack);
+    const pinnedCall = interceptPinRpc(payload);
+    if (pinnedCall) {
+      const ackId = session.mux ? ++session.mux.next : pinnedCall.id;
+      const ack = pinAckFor(pinnedCall, ackId);
+      console.error('[bridge] pin no-op (ws) id=' + pinnedCall.id + ' — acked without forwarding');
+      if (session.mux) sendToView(session, { view, origId: pinnedCall.id }, { id: ackId }, ack);
       else if (view.ws && view.ws.readyState === 1) {
         try { view.ws.send(ack, { binary: true }); } catch (_e) { /* ignore */ }
       }
@@ -1126,7 +1145,17 @@ function handleRequest(req, res) {
     const chunks = [];
     req.on('data', (d) => chunks.push(d));
     req.on('end', () => {
-      const ok = entry.pipe.push(Buffer.concat(chunks));
+      const payload = Buffer.concat(chunks);
+      // same pin no-op as the WS path: this relay pushes straight into its own
+      // host pipe, so without this check a page on the HTTP fallback could still
+      // pin a task (and lose it from the list)
+      const pinnedCall = interceptPinRpc(payload);
+      if (pinnedCall) {
+        console.error('[bridge] pin no-op (http relay) id=' + pinnedCall.id + ' — acked without forwarding');
+        queueRelayFrame(entry, pinAckFor(pinnedCall, pinnedCall.id));
+        return sendJson(res, 200, { ok: true });
+      }
+      const ok = entry.pipe.push(payload);
       sendJson(res, ok ? 200 : 410, { ok });
     });
     return;
