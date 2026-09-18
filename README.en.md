@@ -50,6 +50,48 @@ For git-based deployment see [Manual deployment](#manual-deployment-git-clone); 
 > **Disclaimer**: community project, not affiliated with Zhipu / Z.ai; contains no official code.
 > Follow the official terms of service; model usage is billed per your subscription.
 
+### Disabled by default: the official client's silent "workspace snapshot" upload
+
+On every prompt the official 3.x client (the **headless server runtime too, not just the desktop app**)
+walks this path: ask `GET /api/v1/snapshot/upload-credential` for an upload credential → scan and pack the
+workspace (**`.git/**` bypasses both the secret-name filter and the size cap**) → AES-encrypt with a
+symmetric key wrapped by a server-issued RSA public key (no local decryption key exists) → upload
+`repo-snapshot.tar.gz.enc` as an OSS form post and register it server-side. Local traces live under
+`~/.zcode/v2/checkpoints/<workspace-hash>/` (plaintext manifest + ciphertext). The official setting
+"repo snapshot index" (`repoSnapshotIndexingEnabled`) **does not gate the capture path**, and there is no
+working opt-out.
+
+This project blocks the path inside the host process by default (three layers, `src/repo-snapshot-guard.cjs`,
+injected by `src/host.mjs` via `NODE_OPTIONS=--require`):
+
+1. the credential request is answered locally with `{code:0,data:null}` — the runtime treats it as
+   "server issued no credential" and returns **before** scanning or packing anything;
+2. uploads of the snapshot artifact are refused with 403, matched by OSS form fingerprints
+   (`file=repo-snapshot.tar.gz.enc` / `key=repo-snapshot*` / `x-oss-signature` headers) — this also covers
+   a configured proxy, where the runtime uses its bundled undici fetch and bypasses `globalThis.fetch`,
+   as well as credentials cached in memory;
+3. writes under `~/.zcode/v2/checkpoints/*/{pending,tmp,manifests,extra-manifests}/` are refused
+   (`state.json` stays writable, so the state repo and the host remain healthy).
+
+Every block is logged to stderr and shows up as `[host:stderr] [zcode-webui] repo-snapshot-guard: ...`.
+
+- **Restore vendor behaviour**: set `ZCODE_WEBUI_ALLOW_REPO_SNAPSHOT=1` and restart the service
+  (if you also hardened the `checkpoints` directories, `chmod u+w` them back first).
+- **Impact**: login, conversations, the protocol bridge and local session rollback are unaffected
+  (`npm run smoke` stays green); official features that depend on the upload (repo snapshot index,
+  cross-device restore) silently skip because no credential is ever issued.
+- **Audit tooling** (in-repo, not shipped with the npm package):
+  `node scripts/dev/repo-snapshot-audit.mjs` lists local snapshot records;
+  `node scripts/dev/repo-snapshot-guard-test.mjs` self-tests the guard.
+
+> **Basis of the observation** (2026-09-18, reproducible on the machine used): renderer 3.12.3 plus
+> server runtime 3.11.2; 12 workspaces had snapshot records, 10 uploads were confirmed accepted by the
+> server, two ciphertexts totalling 177 MiB never got a receipt; the manifests are **plaintext** and list
+> `.git/objects/pack` at 57.6 MiB / 63.9 MiB / 21.5 MiB in three cases. Independent external forensics:
+> <https://blog.ferstar.org/posts/zcode-silent-workspace-snapshot-upload/>.
+> All of the above describes verifiable local behaviour; no inference is made about how the server uses
+> the data.
+
 ## Manual deployment (git clone)
 
 ```bash
@@ -251,6 +293,9 @@ cp cli-config.example.json ~/.zcode/cli/config.json && chmod 600 ~/.zcode/cli/co
 - Credentials land in `~/.zcode/v2/credentials.json` (0600); `config.json` is gitignored — never commit
   configs containing secrets.
 - The WS token guards against connecting to the wrong WS service; it is NOT authentication.
+- The official client's background "workspace snapshot" upload (full `.git` history included) is
+  **disabled by default** here — see "Disabled by default: the official client's silent workspace
+  snapshot upload".
 
 ## FAQ
 

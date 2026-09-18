@@ -80,7 +80,7 @@ export function buildHostEnv(serverRoot, extra = {}) {
   const agentArgsJson = process.env.ZCODE_AGENT_SERVER_COMMAND
     ? process.env.ZCODE_AGENT_SERVER_ARGS_JSON
     : JSON.stringify([path.join(serverRoot, 'agents', 'glm', 'zcode.cjs'), 'app-server', '--stdio']);
-  return {
+  const env = {
     ...process.env,
     ZCODE_SERVER_RUNTIME_ROOT: serverRoot,
     ZCODE_ENV: 'production',
@@ -94,6 +94,18 @@ export function buildHostEnv(serverRoot, extra = {}) {
     ...(process.env.ZCODE_AGENT_SERVER_COMMAND ? {} : { ZCODE_AGENT_SERVER_ARGS_JSON: agentArgsJson }),
     ...extra,
   };
+  // Repo-snapshot kill switch: preload the guard into the host — and, through the
+  // inherited NODE_OPTIONS, into every child it spawns (the per-session agent) — so the
+  // vendor's silent workspace-snapshot upload never gets off the ground. See
+  // src/repo-snapshot-guard.cjs for what is blocked and why. Opt out (vendor behaviour)
+  // with ZCODE_WEBUI_ALLOW_REPO_SNAPSHOT=1.
+  if (env.ZCODE_WEBUI_ALLOW_REPO_SNAPSHOT !== '1') {
+    const guard = path.join(PROJECT_ROOT, 'src', 'repo-snapshot-guard.cjs');
+    if (existsSync(guard) && !String(env.NODE_OPTIONS || '').includes(guard)) {
+      env.NODE_OPTIONS = [env.NODE_OPTIONS, '--require=' + guard].filter(Boolean).join(' ');
+    }
+  }
+  return env;
 }
 
 export function spawnHost({ serverRoot, log = console.error.bind(console), extraEnv = {} } = {}) {

@@ -153,6 +153,38 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
   `node scripts/dev/pin-kill-verify.mjs`（真浏览器里确认无可见置顶控件）。
 - 注意：守卫是**服务端代码**，改动后要重启服务才生效（客户端 CSS 部分刷新页面即可）。
 
+### 仓库快照（repo-snapshot）静默上传禁用（2026-09-18）
+
+官方 3.x 客户端在每次 prompt 前后会做「工作区快照」：先向 `GET /api/v1/snapshot/upload-credential`
+申请上传凭证，再按筛选规则扫描工作区打包，**AES + 服务端 RSA 公钥信封加密**后上传到厂商 OSS，
+并在 `~/.zcode/v2/checkpoints/<workspace-hash>/` 留下明文 manifest 与密文。问题有三：
+`.git/` 排在所有排除规则之前（密钥过滤、1MB 体积上限对 `.git/**` 永不生效，历史里出现过的凭据会原样出去）、
+解密私钥只在服务端（本地打不开，不是备份是采集）、以及**没有开关**——设置项 `repoSnapshotIndexingEnabled`
+只是 schema 默认值 + 设置名列表，不参与采集判定（本机它为 `false`，快照照采）。外部取证见
+`blog.ferstar.org/posts/zcode-silent-workspace-snapshot-upload/`。
+
+垫片层的处置（默认开启，`ZCODE_WEBUI_ALLOW_REPO_SNAPSHOT=1` 可恢复厂商行为）：
+
+- `src/repo-snapshot-guard.cjs`：宿主进程 preload，三层拦截——① 凭证请求本地回
+  `{code:0,data:null}`（运行时把 null 当「服务端没发凭证」，`captureBeforePromptUnsafe` 在扫描/打包
+  **之前**就 return，`zcode-server.cjs` 里 `getUploadKey() === null => return`）；② 快照密文的对象上传
+  按 OSS 表单特征（`file=repo-snapshot.tar.gz.enc` / `key=repo-snapshot*` / `x-oss-signature` 头）拒 403，
+  覆盖「设置了 `settings.httpProxy` 走运行时内置 undici、绕过 globalThis.fetch」以及内存里已缓存的凭证；
+  ③ 拦截 `~/.zcode/v2/checkpoints/*/{pending,tmp,manifests,extra-manifests}/` 的写入（`state.json` 保持可写，
+  状态仓库与宿主不受影响）。每次拦截都写 stderr → `zcode-webui.log` 里的 `[host:stderr] [zcode-webui]
+  repo-snapshot-guard: ...`，可审计。采集失败被运行时 `void scheduled.catch(()=>{})` 吞掉，不会打断对话。
+- `src/host.mjs`：`buildHostEnv()` 注入 `NODE_OPTIONS=--require <guard>`（宿主 spawn 的子进程默认继承；
+  采集本身就跑在宿主进程里，所以覆盖面不依赖继承）。
+- 盘点现状：`node scripts/dev/repo-snapshot-audit.mjs [--json]`（逐工作区列出上次快照时间、是否已被接受、
+  manifest 里 `.git` 占比、残留密文）。自检：`node scripts/dev/repo-snapshot-guard-test.mjs`。
+- 本机 2026-09-18 的现状：12 个工作区有快照记录，10 份上传已被服务端接受（含 `writing/recabyss`
+  今天 05:30Z 那份，`.git` 21.5MiB / 39.3%）；`vBookmarks`、`vbookmarkspro` 两份共 177MiB 密文
+  已挪到 `~/.zcode/v2/repo-snapshot-quarantine-20260918T1030Z/`（确认无用可直接删），
+  `~/.zcode/v2/checkpoints` 与其下各工作区的 `pending|tmp|manifests|extra-manifests` 目录已置为 `r-x`
+  作为进程外兜底（新工作区也建不出来；要重新启用厂商行为得先 `chmod u+w` 回来）。
+- 注意：守卫在宿主进程启动时注入，**改完要重启服务**（`./zcode-service.sh restart`）才对新宿主生效；
+  重启窗口照旧看 `/api/background` 的 `activeCount` 为 0。
+
 ## 其他约定
 
 - 提交信息风格：`feat:` / `fix:` / `chore:` 前缀，正文写动机和要点（参考 `git log`）。

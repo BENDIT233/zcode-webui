@@ -1,0 +1,120 @@
+// Unit tests for the repo-snapshot kill switch (src/repo-snapshot-guard.cjs).
+//
+// The guard is a preload, so the tests exercise it exactly the way the host loads it:
+// a plain Node process started with `--require <guard>` (that is what src/host.mjs
+// injects through NODE_OPTIONS). Covered:
+//   - the upload-credential request is answered locally with { code: 0, data: null }
+//     (the shape the runtime maps to "no credential issued" => capture aborts);
+//   - artifact uploads matching the snapshot fingerprint are refused with 403;
+//   - unrelated requests still go to the network (nothing else is swallowed);
+//   - checkpoint artifact writes (pending/tmp/manifests/extra-manifests) fail with
+//     EACCES while state.json keeps working;
+//   - ZCODE_WEBUI_ALLOW_REPO_SNAPSHOT=1 disarms everything.
+//
+// Usage: node scripts/dev/repo-snapshot-guard-test.mjs
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const GUARD = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'src', 'repo-snapshot-guard.cjs');
+
+let failures = 0;
+function check(name, ok, detail) {
+  if (!ok) failures++;
+  console.log((ok ? 'PASS' : 'FAIL') + '  ' + name + (ok || detail === undefined ? '' : '  [' + detail + ']'));
+}
+
+function runProbe(script, env = {}) {
+  const res = spawnSync(process.execPath, ['--require', GUARD, '-e', script], {
+    encoding: 'utf8',
+    env: { ...process.env, ...env },
+  });
+  const line = res.stdout.trim().split('\n').filter(Boolean).pop() || '';
+  let json = null;
+  try { json = JSON.parse(line); } catch (_e) { /* left null, reported below */ }
+  return { json, stdout: res.stdout, stderr: res.stderr, status: res.status };
+}
+
+// ---------- network layer ----------
+const credentialProbe = `
+(async () => {
+  const response = await fetch('https://zcode.z.ai/api/v1/snapshot/upload-credential?workspace_id=deadbeef', {
+    headers: { authorization: 'Bearer test-token' },
+  });
+  console.log(JSON.stringify({ status: response.status, body: await response.json() }));
+})().catch((error) => console.log(JSON.stringify({ error: String((error && error.message) || error) })));
+`;
+const credential = runProbe(credentialProbe);
+check('upload-credential is answered locally', credential.json && credential.json.status === 200 && credential.json.body && credential.json.body.code === 0 && credential.json.body.data === null,
+  JSON.stringify(credential.json));
+check('block is logged to stderr', /blocked upload-credential request/.test(credential.stderr), credential.stderr.trim().split('\n').slice(-1)[0]);
+check('guard announces itself as armed', /repo-snapshot-guard: armed/.test(credential.stderr));
+
+const passthroughProbe = `
+fetch('http://127.0.0.1:9/health').then((r) => console.log(JSON.stringify({ status: r.status })))
+  .catch((error) => console.log(JSON.stringify({ network_error: String((error && error.cause && error.cause.code) || (error && error.message) || error) })));
+`;
+const passthrough = runProbe(passthroughProbe);
+check('unrelated URL still hits the network', passthrough.json && typeof passthrough.json.network_error === 'string',
+  JSON.stringify(passthrough.json));
+
+const uploadProbe = `
+(async () => {
+  const form = new FormData();
+  form.set('file', new Blob(['x']), 'repo-snapshot.tar.gz.enc');
+  form.set('key', 'repo-snapshot/aa/bb.tar.gz.enc');
+  const response = await fetch('https://bucket.oss-cn-hangzhou.aliyuncs.com/', { method: 'POST', body: form });
+  console.log(JSON.stringify({ status: response.status }));
+})().catch((error) => console.log(JSON.stringify({ error: String((error && error.message) || error) })));
+`;
+const upload = runProbe(uploadProbe);
+check('snapshot artifact upload is refused with 403', upload.json && upload.json.status === 403, JSON.stringify(upload.json));
+
+// ---------- filesystem layer ----------
+const ZCODE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-webui-guard-'));
+const wsRoot = path.join(ZCODE_HOME, 'v2', 'checkpoints', '0d8c5c9c184e');
+for (const dir of ['pending', 'tmp', 'manifests', 'extra-manifests']) fs.mkdirSync(path.join(wsRoot, dir), { recursive: true });
+
+const fsProbe = `
+const fs = require('node:fs');
+const fsp = require('node:fs/promises');
+const path = require('node:path');
+const root = path.join(process.env.ZCODE_HOME, 'v2', 'checkpoints', '0d8c5c9c184e');
+(async () => {
+  const out = {};
+  const attempt = async (key, fn) => { try { await fn(); out[key] = 'allowed'; } catch (error) { out[key] = error.code || String(error.message); } };
+  await attempt('pendingSync', () => fs.writeFileSync(path.join(root, 'pending', 'a.tar.gz.enc'), 'x'));
+  await attempt('tmpAsync', () => fsp.writeFile(path.join(root, 'tmp', 'a.tar.gz'), 'x'));
+  await attempt('manifestSync', () => fs.writeFileSync(path.join(root, 'manifests', 'm.json'), '{}'));
+  await attempt('extraManifestStream', () => { fs.createWriteStream(path.join(root, 'extra-manifests', 'e.json')); });
+  await attempt('openForWrite', () => fs.openSync(path.join(root, 'pending', 'b.enc'), 'w'));
+  await attempt('renameIntoPending', () => { fs.writeFileSync(path.join(root, 'scratch'), 'x'); fs.renameSync(path.join(root, 'scratch'), path.join(root, 'pending', 'c.enc')); });
+  await attempt('stateWrite', () => fs.writeFileSync(path.join(root, 'state.json'), '{"ok":true}'));
+  await attempt('readBack', () => { const v = fs.readFileSync(path.join(root, 'state.json'), 'utf8'); if (v !== '{"ok":true}') throw new Error('unexpected'); });
+  await attempt('outsideWrite', () => fs.writeFileSync(path.join(process.env.ZCODE_HOME, 'other.json'), '{}'));
+  console.log(JSON.stringify(out));
+})();
+`;
+const fsRun = runProbe(fsProbe, { ZCODE_HOME });
+const fsResult = fsRun.json || {};
+for (const key of ['pendingSync', 'tmpAsync', 'manifestSync', 'extraManifestStream', 'openForWrite', 'renameIntoPending']) {
+  check('artifact write blocked: ' + key, fsResult[key] === 'EACCES', String(fsResult[key]));
+}
+check('state.json stays writable (host health)', fsResult.stateWrite === 'allowed', String(fsResult.stateWrite));
+check('reading state.json works', fsResult.readBack === 'allowed', String(fsResult.readBack));
+check('writes outside checkpoints/ are untouched', fsResult.outsideWrite === 'allowed', String(fsResult.outsideWrite));
+
+// ---------- escape hatch ----------
+const disarmed = runProbe(passthroughProbe.replace('http://127.0.0.1:9/health', 'http://127.0.0.1:9/api/v1/snapshot/upload-credential?workspace_id=x'), {
+  ZCODE_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-webui-guard-off-')),
+  ZCODE_WEBUI_ALLOW_REPO_SNAPSHOT: '1',
+});
+check('ZCODE_WEBUI_ALLOW_REPO_SNAPSHOT=1 leaves the vendor path alone', disarmed.json && typeof disarmed.json.network_error === 'string',
+  JSON.stringify(disarmed.json));
+check('disarmed guard says so', /repo-snapshot-guard: skipped/.test(disarmed.stderr));
+
+fs.rmSync(ZCODE_HOME, { recursive: true, force: true });
+console.log(failures === 0 ? '\nall repo-snapshot guard checks passed' : '\n' + failures + ' check(s) failed');
+process.exit(failures ? 1 : 0);

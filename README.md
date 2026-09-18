@@ -42,6 +42,40 @@ git 部署方式见[手动部署](#手动部署git-clone)；想省事也可以�
 > **免责声明**：社区项目，与智谱 / Z.ai 无隶属关系；不含任何官方代码。请遵守官方服务条款，
 > 模型调用费用按你的订阅计费。
 
+### 默认禁用：官方客户端的「工作区快照」静默上传
+
+官方 3.x 客户端（**含无界面的服务器运行时，不只是桌面端**）在发起 prompt 时会走这样一条链路：
+向 `GET /api/v1/snapshot/upload-credential` 申请上传凭证 → 按筛选规则扫描工作区打包
+（**`.git/**` 不经过密钥文件名过滤，也不受体积上限约束**）→ AES 加密、密钥由服务端下发的 RSA 公钥
+封装（本地没有解密私钥）→ 以 OSS 表单上传 `repo-snapshot.tar.gz.enc` 并在服务端登记。
+本地痕迹在 `~/.zcode/v2/checkpoints/<workspace-hash>/`（明文 manifest + 密文）。设置项「仓库快照索引」
+（`repoSnapshotIndexingEnabled`）**不参与采集判定**，也没有可用开关关闭它。
+
+本项目默认在宿主进程内拦掉这条链路（三层，`src/repo-snapshot-guard.cjs`，由 `src/host.mjs` 以
+`NODE_OPTIONS=--require` 注入）：
+
+1. 凭证请求本地回 `{code:0,data:null}` —— 运行时按「服务端没发凭证」处理，在扫描/打包**之前**就返回；
+2. 快照密文的对象上传按 OSS 表单特征（`file=repo-snapshot.tar.gz.enc` / `key=repo-snapshot*` /
+   `x-oss-signature` 头）拒 403 —— 覆盖「设置里配了代理、走运行时内置 undici 从而绕过
+   `globalThis.fetch`」以及内存中已缓存凭证的情况；
+3. `~/.zcode/v2/checkpoints/*/{pending,tmp,manifests,extra-manifests}/` 的写入被拒绝
+   （`state.json` 保持可写，状态仓库与宿主不受影响）。
+
+每次拦截都写 stderr，日志里表现为 `[host:stderr] [zcode-webui] repo-snapshot-guard: ...`，可审计。
+
+- **恢复官方行为**：设 `ZCODE_WEBUI_ALLOW_REPO_SNAPSHOT=1` 后重启服务
+  （若已按需对 `checkpoints` 目录做过只读加固，先 `chmod u+w` 回来）。
+- **影响面**：登录、对话、协议桥、本机会话回滚不受影响（`npm run smoke` 全绿）；依赖该上传的官方功能
+  （仓库快照索引 / 跨设备恢复类）会因拿不到凭证而静默跳过。
+- **排查工具**（仓库内，不随 npm 包发布）：`node scripts/dev/repo-snapshot-audit.mjs` 盘点本机快照记录；
+  `node scripts/dev/repo-snapshot-guard-test.mjs` 守卫自检。
+
+> **观测依据**（2026-09-18，本机可复核）：渲染层 3.12.3 + 服务器运行时 3.11.2；12 个工作区存在快照记录，
+> 其中 10 份上传被服务端确认，两份合计 177 MiB 密文未获回执；manifest 为**明文**，其中
+> `.git/objects/pack` 实测 57.6 MiB / 63.9 MiB / 21.5 MiB 三例。外部独立取证见
+> <https://blog.ferstar.org/posts/zcode-silent-workspace-snapshot-upload/>。
+> 以上均为对本机可核查行为的陈述，不对服务端数据的用途作推断。
+
 ## 手动部署（git clone）
 
 ```bash
@@ -225,6 +259,8 @@ cp cli-config.example.json ~/.zcode/cli/config.json && chmod 600 ~/.zcode/cli/co
 - `/api/fs/list`、`/api/login/import`、`/api/sessions/terminate` 能读文件系统/写凭据库/终止任务，同样依赖外层鉴权。
 - 凭据写入 `~/.zcode/v2/credentials.json`（0600）；`config.json` 不入库，不要提交含密钥的配置。
 - WS token 只是防误连其他 WS 服务，不是鉴权手段。
+- 官方客户端的「工作区快照」后台上传（含 `.git` 全量历史）在本项目中**默认被禁用**，
+  见「默认禁用：官方客户端的『工作区快照』静默上传」。
 
 ## 常见问题（FAQ）
 
