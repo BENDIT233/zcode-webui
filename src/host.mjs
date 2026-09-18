@@ -10,6 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_VERSION } from './upgrade.mjs';
+import { resolveDataHome } from './dirs.mjs';
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -92,19 +93,26 @@ export function buildHostEnv(serverRoot, extra = {}) {
     ZCODE_APP_VERSION: process.env.ZCODE_APP_VERSION || rendererVersion(DEFAULT_VERSION),
     ZCODE_AGENT_SERVER_COMMAND: agentCommand,
     ...(process.env.ZCODE_AGENT_SERVER_COMMAND ? {} : { ZCODE_AGENT_SERVER_ARGS_JSON: agentArgsJson }),
+    // where the preloaded api-cache-guard reports its stats so the server can
+    // surface them in /api/health (same data home the server itself resolves)
+    ZCODE_WEBUI_GUARD_STATS_DIR: path.join(resolveDataHome(PROJECT_ROOT), 'data', 'guard-stats'),
     ...extra,
   };
-  // Repo-snapshot kill switch: preload the guard into the host — and, through the
-  // inherited NODE_OPTIONS, into every child it spawns (the per-session agent) — so the
-  // vendor's silent workspace-snapshot upload never gets off the ground. See
-  // src/repo-snapshot-guard.cjs for what is blocked and why. Opt out (vendor behaviour)
-  // with ZCODE_WEBUI_ALLOW_REPO_SNAPSHOT=1.
-  if (env.ZCODE_WEBUI_ALLOW_REPO_SNAPSHOT !== '1') {
-    const guard = path.join(PROJECT_ROOT, 'src', 'repo-snapshot-guard.cjs');
+  // Host-process preloads (they also reach every child the host spawns, through the
+  // inherited NODE_OPTIONS):
+  //   repo-snapshot-guard — kill switch for the vendor's silent workspace-snapshot upload
+  //                         (opt out with ZCODE_WEBUI_ALLOW_REPO_SNAPSHOT=1);
+  //   api-cache-guard     — coalesces the renderer's plan/quota polling and backs off on
+  //                         HTTP 429, which is what made the settings panel show
+  //                         "套餐查询失败" (opt out with ZCODE_WEBUI_BILLING_CACHE_TTL_MS=0).
+  const preload = (file) => {
+    const guard = path.join(PROJECT_ROOT, 'src', file);
     if (existsSync(guard) && !String(env.NODE_OPTIONS || '').includes(guard)) {
       env.NODE_OPTIONS = [env.NODE_OPTIONS, '--require=' + guard].filter(Boolean).join(' ');
     }
-  }
+  };
+  if (env.ZCODE_WEBUI_ALLOW_REPO_SNAPSHOT !== '1') preload('repo-snapshot-guard.cjs');
+  preload('api-cache-guard.cjs');
   return env;
 }
 
@@ -118,12 +126,45 @@ export function spawnHost({ serverRoot, log = console.error.bind(console), extra
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let stderrTail = '';
+  // Vendor stderr is chatty and highly repetitive (provider sync loops re-log the
+  // same blocks every minute). First occurrences pass through unchanged; exact
+  // repeats within a minute are counted and flushed as one summary line. Chunks
+  // longer than 4KB (multi-KB revision dumps) are clipped. `stderrTail` keeps the
+  // raw stream for exit diagnostics either way.
+  const repeats = new Map();          // key (first 200 chars) -> { n, until, seen }
+  const REPEAT_WINDOW_MS = 60000;
+  const CLIP_BYTES = 4000;
+  const flushRepeats = () => {
+    const now = Date.now();
+    for (const [k, e] of repeats) {
+      if (e.n > 0) log('[host:stderr] … suppressed ' + e.n + ' repeat(s): ' + k.replace(/\s+/g, ' ').slice(0, 120));
+      if (now >= e.until) repeats.delete(k);
+      else e.n = 0;
+    }
+    if (repeats.size > 128) {          // bound the tracker itself
+      for (const k of repeats.keys()) { repeats.delete(k); if (repeats.size <= 64) break; }
+    }
+  };
+  const flushTimer = setInterval(flushRepeats, 30000);
+  if (flushTimer.unref) flushTimer.unref();
   child.stderr.on('data', (d) => {
-    stderrTail = (stderrTail + d.toString()).slice(-8000);
-    log('[host:stderr] ' + d.toString());
+    const text = d.toString();
+    stderrTail = (stderrTail + text).slice(-8000);
+    const now = Date.now();
+    const key = text.slice(0, 200);
+    let e = repeats.get(key);
+    if (!e || now >= e.until) {
+      e = { n: 0, until: now + REPEAT_WINDOW_MS, seen: false };
+      repeats.set(key, e);
+    }
+    if (e.seen) { e.n++; return; }     // repeat inside the window: count only
+    e.seen = true;
+    log('[host:stderr] ' + (text.length > CLIP_BYTES ? text.slice(0, CLIP_BYTES) + ' …[clipped ' + text.length + 'B]' : text));
   });
   child.on('error', (err) => log('[host] spawn error: ' + err.message));
   child.on('exit', (code, signal) => {
+    clearInterval(flushTimer);
+    flushRepeats();
     const tail = stderrTail.trim();
     if (tail) log('[host] exited code=' + code + ' signal=' + signal + '\n' + tail.slice(-3000));
     else log('[host] exited code=' + code + ' signal=' + signal);

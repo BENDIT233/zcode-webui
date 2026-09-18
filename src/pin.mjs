@@ -28,10 +28,15 @@ export const PIN_CHANNELS = ['zcode-task'];
 export const PIN_METHOD = 'setTaskPinned';
 
 // Decode a renderer call; returns { type, id, channel, method, params } or null.
+// Header-first: the channel/method gate runs BEFORE the body is deserialized —
+// this guard sees EVERY inbound frame, and big frames (long prompts, pasted
+// content, uploads) must not pay a full JSON.parse just to learn they are not
+// pin calls.
 export function decodePinCall(payload) {
   let header;
   try { header = decodeRpcHeader(payload); } catch (_e) { return null; }
   if (!header) return null;
+  if (PIN_CHANNELS.indexOf(header.channel) < 0 || header.method !== PIN_METHOD) return null;
   let body;
   try { body = decodeRpc(payload).body; } catch (_e) { body = null; }
   const params = Array.isArray(body) ? body[0] : body;   // host args array

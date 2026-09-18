@@ -7,8 +7,8 @@
 // ZCODE_WEBUI_OAUTH_PROXY, ZCODE_SERVER_RUNTIME_ROOT.
 
 import http from 'node:http';
-import { closeSync, createReadStream, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs';
-import { createHash, randomUUID } from 'node:crypto';
+import { closeSync, createReadStream, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, truncateSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -46,6 +46,17 @@ const PORT = (() => {
   return Number.isFinite(n) && n >= 1 && n <= 65535 ? n : 3102;
 })();
 const WORKSPACE = process.env.ZCODE_WEBUI_WORKSPACE || argValue('workspace', fileConfig.workspace) || os.homedir();
+// Bind address: loopback by default so the service is not silently LAN-exposed;
+// open it up explicitly (config "host" / --host / ZCODE_WEBUI_HOST, e.g. "0.0.0.0")
+// when a reverse proxy on another host needs to reach it.
+const BIND_HOST = (() => {
+  const h = process.env.ZCODE_WEBUI_HOST || argValue('host', fileConfig.host) || '127.0.0.1';
+  return h === '*' ? '0.0.0.0' : h;
+})();
+// Optional shared-secret gate: when set (config "accessToken" /
+// ZCODE_WEBUI_ACCESS_TOKEN / --access-token), every page/api/bridge/ws request
+// must carry the cookie issued by the /access page. Empty = gate disabled.
+const ACCESS_TOKEN = process.env.ZCODE_WEBUI_ACCESS_TOKEN || argValue('access-token', fileConfig.accessToken) || '';
 const OAUTH_PROXY = process.env.ZCODE_WEBUI_OAUTH_PROXY || argValue('oauth-proxy', fileConfig.oauthProxy) || '';
 // proxy used by the spawned host/agent processes for ZCode cloud + model APIs
 // (set ZCODE_HTTP_PROXY / ZCODE_NO_PROXY in the child env)
@@ -74,6 +85,10 @@ try {
 const WS_TOKEN = randomUUID();
 const WS_READY = '{"kind":"zcode-webui-ready"}';
 
+// Cache-buster for the injected scripts: stable for the life of this process so
+// browsers reuse them across reloads; a restart (code change) busts it naturally.
+const ASSET_VERSION = '?v=' + Date.now().toString(36);
+
 // ---------- client identity ----------
 // A long-lived cookie identifies the browser (all tabs share it), a sessionStorage
 // tab id identifies one tab across reloads. Together they let us re-attach a tab to
@@ -98,6 +113,43 @@ function parseCookies(header) {
   return out;
 }
 const CLIENT_COOKIE = 'zwebui_client';
+
+// ---------- optional access-token gate ----------
+// When ACCESS_TOKEN is configured, the browser must exchange it for the
+// zwebui_access cookie at /access first; everything else (pages, /api, /bridge,
+// WS upgrades) is refused without it. The cookie stores sha256(token), so the
+// raw secret never round-trips; it rotates whenever the operator changes the token.
+const ACCESS_COOKIE = 'zwebui_access';
+const accessCookieValue = ACCESS_TOKEN
+  ? createHash('sha256').update('zcode-webui-access:' + ACCESS_TOKEN).digest('hex')
+  : '';
+function cookieMatches(value) {
+  if (!ACCESS_TOKEN || typeof value !== 'string' || !value) return false;
+  const a = Buffer.from(value, 'utf8');
+  const b = Buffer.from(accessCookieValue, 'utf8');
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+function tokenMatches(token) {
+  if (!ACCESS_TOKEN || typeof token !== 'string' || !token) return false;
+  return cookieMatches(createHash('sha256').update('zcode-webui-access:' + token).digest('hex'));
+}
+function hasAccess(req) {
+  if (!ACCESS_TOKEN) return true;
+  return cookieMatches(parseCookies(req.headers.cookie)[ACCESS_COOKIE] || '');
+}
+let accessFailures = 0;
+function noteAccessFailure(req) {
+  accessFailures++;
+  if (accessFailures <= 5 || accessFailures % 50 === 0) {
+    console.error('[http] access denied (' + (accessFailures <= 5 ? 'bad token' : 'bad token, ' + accessFailures + ' attempts so far') + ') from '
+      + (req.headers['x-forwarded-for'] || req.socket.remoteAddress));
+  }
+}
+function serveAccessPage(res) {
+  const f = path.join(WEB_DIR, 'access.html');
+  const html = existsSync(f) ? readFileSync(f, 'utf8') : '<h1>missing access.html</h1>';
+  return send(res, 200, html, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+}
 
 // stable per-account key (in-memory only, never logged in full; the account id
 // itself stays out of logs by using a short hash)
@@ -157,6 +209,9 @@ const ACTIVE_FRAME_MS = Math.max(Number(process.env.ZCODE_WEBUI_ACTIVE_FRAME_MS)
 // /bridge/send and /bridge/poll, so an actively polling page never ages out.
 const HTTP_RELAY_TTL_MS = Number(process.env.ZCODE_WEBUI_HTTP_RELAY_TTL_MS || 30 * 60 * 1000);
 const HTTP_RELAY_MAX = Number(process.env.ZCODE_WEBUI_HTTP_RELAY_MAX || 8) || 0;   // 0 = unlimited
+// upper bound for one /bridge/send body — legit RPC frames are far smaller, and
+// without a cap a rogue client could buffer unbounded memory server-side
+const BRIDGE_MAX_BODY_BYTES = Math.max(1, Number(process.env.ZCODE_WEBUI_BRIDGE_MAX_BODY_MB) || 32) * 1024 * 1024;
 
 function tasksIndexPath() {
   const zhome = process.env.ZCODE_HOME || path.join(os.homedir(), '.zcode');
@@ -264,7 +319,8 @@ const MIME = {
   '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.ico': 'image/x-icon',
   '.woff': 'font/woff', '.woff2': 'font/woff2', '.ttf': 'font/ttf', '.otf': 'font/otf',
   '.pdf': 'application/pdf', '.map': 'application/json', '.txt': 'text/plain; charset=utf-8',
-  '.wasm': 'application/wasm', '.webp': 'image/webp',
+  '.wasm': 'application/wasm', '.webp': 'image/webp', '.avif': 'image/avif',
+  '.csv': 'text/csv; charset=utf-8', '.webmanifest': 'application/manifest+json',
 };
 
 function send(res, status, body, headers = {}) {
@@ -283,17 +339,32 @@ function safeJoin(dir, rel) {
   if (!p.startsWith(dir + path.sep) && p !== dir) return null;
   return p;
 }
-function serveFile(res, filePath) {
+// Content-hashed renderer directories: filenames change on every upgrade, so they
+// are safe to cache immutably — this is what keeps reloads from re-downloading the
+// ~60MB renderer on every page load. Everything else revalidates via ETag (304).
+const IMMUTABLE_PATH_PREFIXES = ['/assets/', '/material-icons/', '/pdfjs/'];
+function serveFile(req, res, filePath, urlPath) {
   let st;
   try { st = statSync(filePath); } catch (_e) { return send(res, 404, 'not found'); }
   if (!st.isFile()) return send(res, 404, 'not found');
   const ext = path.extname(filePath).toLowerCase();
   const mime = MIME[ext] || 'application/octet-stream';
-  res.writeHead(200, {
+  const headers = {
     'Content-Type': mime,
     'Content-Length': String(st.size),
-    'Cache-Control': 'no-cache',
-  });
+  };
+  if (urlPath && IMMUTABLE_PATH_PREFIXES.some((p) => urlPath.startsWith(p))) {
+    headers['Cache-Control'] = 'public, max-age=31536000, immutable';
+  } else {
+    headers['Cache-Control'] = 'no-cache';
+    const etag = '"' + st.size.toString(16) + '-' + st.mtimeMs.toString(16) + '"';
+    headers['ETag'] = etag;
+    if (req && String(req.headers['if-none-match'] || '') === etag) {
+      res.writeHead(304, headers);
+      return res.end();
+    }
+  }
+  res.writeHead(200, headers);
   const stream = createReadStream(filePath);
   stream.on('error', () => { try { res.destroy(); } catch (_e) { /* ignore */ } });
   stream.pipe(res);
@@ -307,7 +378,7 @@ function readRendererIndex() {
   // NOTE: injected script srcs are RELATIVE (./__zcode_webui/...) so they resolve
   // under whatever public prefix the reverse proxy uses (code-server strips
   // /proxy/<port> before forwarding; absolute paths would escape the prefix).
-  const assetVersion = '?v=' + Date.now().toString(36);
+  const assetVersion = ASSET_VERSION;
   // INLINE redirect: relative URLs break when the page URL is '/proxy/<port>'
   // without a trailing slash (e.g. ./assets resolves to /proxy/assets). code-server
   // strips the prefix before forwarding, so the backend cannot fix this — redirect
@@ -450,7 +521,7 @@ function readProcessMonitorPage() {
   const p = path.join(RENDERER_DIR, 'process-monitor.html');
   if (!existsSync(p)) return null;
   let html = readFileSync(p, 'utf8');
-  const shim = '<script src="./__zcode_webui/process-monitor-bridge.js?v=' + Date.now().toString(36) + '"></script>';
+  const shim = '<script src="./__zcode_webui/process-monitor-bridge.js' + ASSET_VERSION + '"></script>';
   const metaViewport = '<meta name="viewport" content="width=device-width, initial-scale=1.0" />';
   if (html.includes(metaViewport)) {
     html = html.replace(metaViewport, metaViewport + shim);
@@ -534,6 +605,16 @@ function officialUpdateState() {
   });
 }
 
+// ---------- guard observability ----------
+// The api-cache-guard runs inside every HOST process (preload), not here, so it
+// reports its stats through a small JSON file the server reads on demand.
+function guardStatsSnapshot() {
+  try {
+    const j = JSON.parse(readFileSync(path.join(PATHS.dataHome, 'data', 'guard-stats', 'api-cache-guard.json'), 'utf8'));
+    return { hits: j.hits || 0, misses: j.misses || 0, coalesced: j.coalesced || 0, backoffSkips: j.backoffSkips || 0, errors: j.errors || 0, at: j.at || null, pid: j.pid || null };
+  } catch (_e) { return null; }
+}
+
 // ---------- log export (Help menu → 导出日志) ----------
 // Plain-text bundle: service snapshot + process tree + the service log tail.
 // The browser side turns this into a downloaded file; the renderer's own toast
@@ -585,11 +666,17 @@ let loginRun = null; // {child, url(), output()}
 let loginLog = '';
 
 // ---------- host pipe (shared by WS transport and HTTP fallback transport) ----------
-async function openHostPipe() {
-  await ensureWorkspaceDirs();
-  const extraEnv = HOST_PROXY
+// Outbound proxy for host/agent cloud calls. BOTH transports must pass it: the
+// session path (createSession) originally forgot it, so only HTTP-relay hosts
+// honored config.hostProxy while every WS-spawned host went direct.
+function hostExtraEnv() {
+  return HOST_PROXY
     ? { ZCODE_HTTP_PROXY: HOST_PROXY, ZCODE_NO_PROXY: 'localhost,127.0.0.1' }
     : {};
+}
+async function openHostPipe() {
+  await ensureWorkspaceDirs();
+  const extraEnv = hostExtraEnv();
   const host = spawnHost({ serverRoot, log: (l) => console.error(l), extraEnv });
   const { child } = host;
   return handshake(child).then(({ hello, rest }) => {
@@ -645,6 +732,10 @@ async function openHostPipe() {
 //   - a session with zero views parks detached and keeps running its turns
 //     (the reaper cleans idle ones); the first view to (re)attach adopts it.
 const sessions = new Map();       // userKey -> session
+const pendingSpawns = new Map();  // userKey -> Promise<session>: concurrent first-connects
+                                  // coalesce onto ONE host instead of racing to spawn two
+                                  // (the loser used to be overwritten in `sessions` and
+                                  // became a host the reaper could never see again)
 const httpRelays = new Map();     // id -> {pipe, queue, waiter, waiterTimer, lastSeen} (HTTP long-poll fallback)
 
 // hand one server-synthesised payload to the next /bridge/poll of a relay,
@@ -723,7 +814,7 @@ function writeToHost(session, view, payload) {
       const rewritten = rewriteRpcId(payload, gid);
       if (!rewritten) { session.mux.dropped++; return true; }
       view.sent.add(gid);
-      session.mux.pending.set(gid, { view, origId: hdr.id });
+      session.mux.pending.set(gid, { view, origId: hdr.id, at: Date.now() });
       payload = rewritten;
     } else if (hdr && hdr.type === 101) {
       // cancel: renderer refers to its original id — find the global twin
@@ -891,7 +982,7 @@ async function createSession(userKey, tabId) {
   await ensureWorkspaceDirs();
   let child;
   try {
-    const host = spawnHost({ serverRoot, log: (l) => console.error(l) });
+    const host = spawnHost({ serverRoot, log: (l) => console.error(l), extraEnv: hostExtraEnv() });
     child = host.child;
   } catch (err) {
     throw new Error('failed to spawn host: ' + err.message);
@@ -1026,9 +1117,16 @@ const server = http.createServer((req, res) => {
   }
 });
 
+// Pure polling endpoints whose successful GETs carry no signal — keep them out of
+// the request log (they dominated the [http] volume; failures still surface via
+// their own error paths).
+const HTTP_LOG_SKIP = new Set(['/api/background', '/api/process-metrics', '/bridge/poll', '/api/health', '/api/update-check', '/api/login/status']);
+
 function handleRequest(req, res) {
   // request logging (diagnostics)
-  if (!req.url.startsWith('/assets/') && !req.url.startsWith('/material-icons/') && !req.url.startsWith('/pdfjs/')) {
+  const logPathOnly = (req.url || '').split('?')[0];
+  const skipHttpLog = req.method === 'GET' && HTTP_LOG_SKIP.has(logPathOnly);
+  if (!skipHttpLog && !req.url.startsWith('/assets/') && !req.url.startsWith('/material-icons/') && !req.url.startsWith('/pdfjs/')) {
     console.error('[http] ' + new Date().toISOString() + ' ' + (req.headers['x-forwarded-for'] || req.socket.remoteAddress) + ' ' + req.method + ' ' + req.url + ' UA=' + String(req.headers['user-agent'] || '').slice(0, 80));
   }
   // browser identity cookie: lets a re-opened tab adopt the host it left running
@@ -1046,8 +1144,55 @@ function handleRequest(req, res) {
   }
   if (!urlPath.startsWith('/')) urlPath = '/' + urlPath;
 
+  // ---- access-token gate (only when ACCESS_TOKEN is configured) ----
+  // Unauthenticated HTML requests get the gate page served IN PLACE (200, same
+  // URL): a plain reload after the cookie is set keeps working behind
+  // prefix-stripping proxies (code-server /proxy/<port>), where this server
+  // cannot know the public URL an absolute redirect would need. API/bridge
+  // paths and asset-ish extensions get a plain 401; /api/health answers a
+  // minimal payload so monitoring probes keep working.
+  if (ACCESS_TOKEN && !hasAccess(req)
+      && urlPath !== '/api/health'
+      && !(urlPath === '/api/access' && req.method === 'POST')) {
+    if (urlPath.startsWith('/api/') || urlPath.startsWith('/bridge/')) {
+      noteAccessFailure(req);
+      return sendJson(res, 401, { ok: false, error: 'access token required' });
+    }
+    const ext = path.extname(urlPath).toLowerCase();
+    if (ext && ext !== '.html' && ext !== '.ico') {
+      return send(res, 401, 'unauthorized');
+    }
+    return serveAccessPage(res);
+  }
+
   // api
+  if (urlPath === '/api/access' && req.method === 'POST') {
+    if (!ACCESS_TOKEN) return sendJson(res, 400, { ok: false, error: 'access token not configured' });
+    let body = '';
+    req.on('data', (d) => { body += d; if (body.length > 4096) req.destroy(); });
+    req.on('end', () => {
+      let token = '';
+      try { token = String((JSON.parse(body) || {}).token || ''); } catch (_e) { /* malformed body */ }
+      if (tokenMatches(token)) {
+        accessFailures = 0;
+        send(res, 200, JSON.stringify({ ok: true }), {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'Set-Cookie': ACCESS_COOKIE + '=' + accessCookieValue + '; Path=/; SameSite=Lax; HttpOnly; Max-Age=2592000',
+        });
+      } else {
+        noteAccessFailure(req);
+        sendJson(res, 401, { ok: false, error: 'invalid token' });
+      }
+    });
+    return;
+  }
+
   if (urlPath === '/api/health') {
+    if (ACCESS_TOKEN && !hasAccess(req)) {
+      // probes only need a 200; the detailed snapshot stays behind the gate
+      return sendJson(res, 200, { ok: true, authRequired: true });
+    }
     const all = [...sessions.values()];
     const withHello = all.find((s) => !s.closed && s.hello);
     return sendJson(res, 200, {
@@ -1066,6 +1211,9 @@ function handleRequest(req, res) {
       },
       reaper: { enabled: DETACHED_TTL_MS > 0, ttlMs: DETACHED_TTL_MS },
       httpRelays: httpRelays.size,
+      bindHost: BIND_HOST,
+      accessGate: !!ACCESS_TOKEN,
+      guards: { apiCache: guardStatsSnapshot() },
     });
   }
   if (urlPath === '/api/login/status') {
@@ -1143,8 +1291,20 @@ function handleRequest(req, res) {
     if (!entry || entry.pipe.closed) return sendJson(res, 410, { ok: false, error: 'session gone' });
     entry.lastSeen = Date.now();
     const chunks = [];
-    req.on('data', (d) => chunks.push(d));
+    let bodyBytes = 0;
+    let overflowed = false;
+    req.on('data', (d) => {
+      bodyBytes += d.length;
+      if (bodyBytes <= BRIDGE_MAX_BODY_BYTES) { chunks.push(d); return; }
+      if (!overflowed) {
+        overflowed = true;
+        console.error('[bridge] inbound body exceeds ' + BRIDGE_MAX_BODY_BYTES + 'B, rejecting');
+        try { send(res, 413, 'payload too large'); } catch (_e) { /* socket may be gone */ }
+      }
+      req.destroy();
+    });
     req.on('end', () => {
+      if (overflowed) return;
       const payload = Buffer.concat(chunks);
       // same pin no-op as the WS path: this relay pushes straight into its own
       // host pipe, so without this check a page on the HTTP fallback could still
@@ -1175,6 +1335,12 @@ function handleRequest(req, res) {
       });
       res.writeHead(200, hdrs);
       return res.end(Buffer.concat(parts));
+    }
+    if (entry.waiter) {                     // a previous poll never resolved (client
+      const w = entry.waiter;               // raced a second one in) — complete it
+      entry.waiter = null;                  // empty so that client re-polls at once
+      clearTimeout(entry.waiterTimer);
+      w(Buffer.alloc(0));
     }
     entry.waiter = (payload) => {
       res.writeHead(200, hdrs);
@@ -1270,15 +1436,28 @@ function handleRequest(req, res) {
     return;
   }
 
-  // directory listing for the web directory picker
+  // directory listing for the web directory picker — clamped to the workspace
+  // and the user's home so the endpoint cannot be used to map the whole disk
+  const FS_LIST_ROOTS = [...new Set(
+    [WORKSPACE, os.homedir()].map((p) => { try { return path.resolve(p); } catch (_e) { return ''; } }).filter(Boolean)
+  )];
+  const fsUnderRoot = (p) => FS_LIST_ROOTS.some((r) => p === r || p.startsWith(r + path.sep));
   if (urlPath === '/api/fs/list' && req.method === 'GET') {
     const q = new URL(req.url, 'http://x').searchParams;
     let p = (q.get('path') || WORKSPACE || os.homedir()).trim();
     if (!p || !path.isAbsolute(p)) p = os.homedir();
+    p = path.resolve(p);
+    if (!fsUnderRoot(p)) {
+      return sendJson(res, 403, { ok: false, error: 'outside the allowed roots (workspace / home)' });
+    }
+    // clamp upward navigation: when dirname leaves the roots (p IS a root), stop
+    // showing a ".." row instead of erroring on the next click
+    let parent = path.dirname(p);
+    if (!fsUnderRoot(parent)) parent = p;
     try {
       const entries = readdirSync(p, { withFileTypes: true });
       const dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name).sort();
-      sendJson(res, 200, { ok: true, path: p, parent: path.dirname(p), dirs });
+      sendJson(res, 200, { ok: true, path: p, parent, dirs });
     } catch (e) {
       sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
     }
@@ -1328,7 +1507,17 @@ function handleRequest(req, res) {
   // webui injected assets
   if (urlPath.startsWith('/__zcode_webui/')) {
     const f = safeJoin(WEB_DIR, urlPath.slice('/__zcode_webui/'.length).split('?')[0]);
-    return f ? serveFile(res, f) : send(res, 404, 'not found');
+    return f ? serveFile(req, res, f, urlPath) : send(res, 404, 'not found');
+  }
+
+  // access-token gate page (canonical URL; the gate itself serves this page in
+  // place on any unauthenticated HTML request — see the gate block above)
+  if (urlPath === '/access') {
+    if (!ACCESS_TOKEN || hasAccess(req)) {
+      res.writeHead(302, { Location: './' });   // relative — safe behind stripping proxies
+      return res.end();
+    }
+    return serveAccessPage(res);
   }
 
   // login page
@@ -1373,7 +1562,7 @@ function handleRequest(req, res) {
     return send(res, 200, html, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
   }
   const f = safeJoin(RENDERER_DIR, urlPath.slice(1));
-  return f ? serveFile(res, f) : send(res, 404, 'not found');
+  return f ? serveFile(req, res, f, urlPath) : send(res, 404, 'not found');
 }
 
 // ---------- websocket ----------
@@ -1398,6 +1587,11 @@ function handleUpgrade(req, socket, head) {
     urlPath = urlPath.slice(base.length) || '/';
   }
   if (urlPath !== '/ws') return socket.destroy();
+  if (!hasAccess(req)) {
+    console.error('[ws] rejected upgrade without access cookie from ' + req.socket.remoteAddress);
+    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+    return socket.destroy();
+  }
   const q = new URL(req.url, 'http://x').searchParams;
   const token = q.get('token');
   if (token !== WS_TOKEN) {
@@ -1434,10 +1628,31 @@ function handleUpgrade(req, socket, head) {
         ' tab=' + tabId.slice(0, 8) + ' (user ' + shortUserKey(userKey) + ', views=' + session.views.size +
         ', last frame ' + (session.lastFrameAt ? Math.round((Date.now() - session.lastFrameAt) / 1000) + 's ago' : 'never') + ')');
     } else {
+      // Coalesce concurrent first-connects onto ONE host: createSession yields
+      // (ensureWorkspaceDirs I/O) between the map lookup and its sessions.set,
+      // so two tabs opening at the same moment used to spawn two hosts — the
+      // overwritten one then lived outside `sessions` where no reaper could
+      // ever see it again.
+      let createdHere = false;
+      let spawnPromise = pendingSpawns.get(userKey);
+      if (!spawnPromise) {
+        createdHere = true;
+        spawnPromise = createSession(userKey, tabId);
+        pendingSpawns.set(userKey, spawnPromise);
+        const clear = () => pendingSpawns.delete(userKey);
+        spawnPromise.then(clear, clear);
+      }
       try {
-        session = await createSession(userKey, tabId);
+        session = await spawnPromise;
       } catch (err) {
         console.error('[ws] host spawn failed: ' + err.message);
+        socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+        return socket.destroy();
+      }
+      // a coalesced waiter attaches to a host it did not spawn: treat it exactly
+      // like any late-joining view (Initialize replay + hold gating)
+      if (!createdHere) adopted = true;
+      if (session.closed) {          // spawned, but already died again (handshake failed)
         socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
         return socket.destroy();
       }
@@ -1575,6 +1790,52 @@ setInterval(() => {
   }
 }, 30000).unref();
 
+// Stale-call sweeper: a mux pending entry whose host never answered would
+// otherwise live forever (tiny leak, but it also pins the view's `sent` set).
+const PENDING_CALL_TTL_MS = 10 * 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const s of [...sessions.values()]) {
+    if (!s.mux) continue;
+    let reaped = 0;
+    for (const [gid, e] of s.mux.pending) {
+      if (!e.at || now - e.at <= PENDING_CALL_TTL_MS) continue;
+      s.mux.pending.delete(gid);
+      if (e.view && e.view.sent) e.view.sent.delete(gid);
+      s.mux.dropped++;
+      reaped++;
+    }
+    if (reaped > 0) console.error('[mux] reaped ' + reaped + ' pending call(s) with no response in ' + Math.round(PENDING_CALL_TTL_MS / 1000) + 's (host pid ' + (s.child && s.child.pid) + ')');
+  }
+}, 60000).unref();
+
+// ---------- log overflow guard ----------
+// zcode-service.sh rotates by size on every start; this is the safety net for
+// very long uptimes. O_APPEND (the shell's >> redirect) makes truncating safe —
+// later writes land at the new EOF. The last 8 MiB are preserved in
+// zcode-webui.log.overflow for forensics before the truncate.
+const LOG_MAX_BYTES = Number(process.env.ZCODE_WEBUI_LOG_MAX_MB) > 0
+  ? Number(process.env.ZCODE_WEBUI_LOG_MAX_MB) * 1024 * 1024
+  : 200 * 1024 * 1024;
+setInterval(() => {
+  const logPath = path.join(ROOT, 'zcode-webui.log');
+  try {
+    const st = statSync(logPath);
+    if (st.size <= LOG_MAX_BYTES) return;
+    const start = Math.max(0, st.size - 8 * 1024 * 1024);
+    const fh = openSync(logPath, 'r');
+    let tail;
+    try {
+      tail = Buffer.alloc(st.size - start);
+      readSync(fh, tail, 0, tail.length, start);
+    } finally { closeSync(fh); }
+    writeFileSync(logPath + '.overflow', tail);
+    truncateSync(logPath, 0);
+    console.error('[zcode-webui] log self-rotation: kept an 8MiB tail in zcode-webui.log.overflow, truncated '
+      + st.size + ' bytes (tune with ZCODE_WEBUI_LOG_MAX_MB)');
+  } catch (_e) { /* best-effort — never take the service down over logging */ }
+}, 15 * 60 * 1000).unref();
+
 // ---------- start ----------
 // Bind failures (EADDRINUSE…) are STARTUP errors: unlike request-path faults
 // they leave a process that can never serve, so exit loudly instead of relying
@@ -1583,9 +1844,12 @@ server.on('error', (err) => {
   console.error('[zcode-webui] fatal server error: ' + ((err && err.stack) || err));
   process.exit(2);
 });
-server.listen(PORT, '0.0.0.0', () => {
-  console.log('[zcode-webui] listening on http://0.0.0.0:' + PORT + base + '/');
+server.listen(PORT, BIND_HOST, () => {
+  console.log('[zcode-webui] listening on http://' + BIND_HOST + ':' + PORT + base + '/');
   console.log('[zcode-webui] base path : ' + (base || '(root)'));
+  console.log('[zcode-webui] access gate: ' + (ACCESS_TOKEN
+    ? 'ENABLED — enter the token at ' + joinBase('/access') + ' (cookie ' + ACCESS_COOKIE + ')'
+    : 'disabled (set accessToken / ZCODE_WEBUI_ACCESS_TOKEN to enable)'));
   console.log('[zcode-webui] data home : ' + PATHS.dataHome);
   console.log('[zcode-webui] workspace  : ' + WORKSPACE);
   console.log('[zcode-webui] serverRoot : ' + (serverRoot || '(missing)'));

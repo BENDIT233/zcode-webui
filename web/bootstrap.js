@@ -18,22 +18,13 @@
     localStorage.setItem('zcode-v4-client-id:v1', cfg.deviceId || 'zcode-webui-client');
   } catch (e) { /* ignore */ }
 
-  // ---- tab identity (survives reloads, unique per tab) + takeover flag ----
+  // ---- tab identity (survives reloads, unique per tab) ----
   var TAB_ID = '';
   try { TAB_ID = sessionStorage.getItem('zwebui_tab') || ''; } catch (e) { /* ignore */ }
   if (!TAB_ID) {
     TAB_ID = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('tab-' + Math.random().toString(36).slice(2) + Date.now().toString(36));
     try { sessionStorage.setItem('zwebui_tab', TAB_ID); } catch (e) { /* ignore */ }
   }
-  var TAKEOVER = '0';
-  try {
-    var initQs = new URLSearchParams(window.location.search);
-    if (initQs.get('takeover') === '1') {
-      TAKEOVER = '1';
-      initQs.delete('takeover');
-      window.history.replaceState(null, '', window.location.pathname + (initQs.toString() ? '?' + initQs.toString() : ''));
-    }
-  } catch (e) { /* ignore */ }
 
   // ---- browser-side diagnostics: forward errors to the server log + visible banner ----
   var reported = 0;
@@ -101,19 +92,6 @@
       el.appendChild(t);
       el.appendChild(b);
     } catch (e) { /* ignore */ }
-  }
-
-  // superseded by another tab: park this page with an explicit take-back control
-  function parkWithNotice() {
-    mode = 'parked';
-    dismissBackground();
-    showNotice('本页面的会话已被另一个标签页接管，此页面已暂停。', '接管回来', function () {
-      try {
-        var q = new URLSearchParams(window.location.search);
-        q.set('takeover', '1');
-        window.location.search = q.toString();
-      } catch (e) { window.location.reload(); }
-    });
   }
 
   // ---- cross-device execution visibility ----
@@ -407,7 +385,6 @@
   function wsUrl() {
     return wsProto + '//' + window.location.host + wsPath + '?token=' + (cfg.wsToken || '') +
       '&tab=' + encodeURIComponent(TAB_ID) +
-      (TAKEOVER === '1' ? '&takeover=1' : '') +
       (everDelivered ? '&resume=1' : '');
   }
   var wsVerified = false;
@@ -457,9 +434,6 @@
     };
     ws.onclose = function (ev) {
       if (mode !== 'ws') return;
-      // 4001: another tab of this browser took over this page's session; park here
-      // (do NOT reload — that would ping-pong the takeover between tabs).
-      if (ev.code === 4001) { parkWithNotice(); return; }
       if (!wsOpened) { startHttpMode(); return; }
       if (ev.code === 4000 || ev.code === 1011) {
         // host exited (crash / server restart): the renderer must re-bootstrap
@@ -531,9 +505,18 @@
   } catch (e) { /* ignore */ }
 
   // if the websocket does not open quickly (SSO/proxy blocks upgrades), fall back
-  setTimeout(function () {
-    if (!wsOpened && mode === 'ws') startHttpMode();
-  }, forceHttp ? 1 : 3000);
+  // — but while the socket is still CONNECTING, give slow proxies two extra
+  // windows before degrading to long-polling
+  var httpFallbackTries = 0;
+  function maybeStartHttpMode() {
+    if (wsOpened || mode !== 'ws') return;
+    if (ws && ws.readyState === 0 && httpFallbackTries++ < 3) {
+      setTimeout(maybeStartHttpMode, 3000);
+      return;
+    }
+    startHttpMode();
+  }
+  setTimeout(maybeStartHttpMode, forceHttp ? 1 : 3000);
 
   // watchdog: if the official app never mounts, reload once (fresh attempt)
   setTimeout(function () {
