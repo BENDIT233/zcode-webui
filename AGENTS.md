@@ -165,18 +165,27 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
 
 垫片层的处置（默认开启，`ZCODE_WEBUI_ALLOW_REPO_SNAPSHOT=1` 可恢复厂商行为）：
 
-- `src/repo-snapshot-guard.cjs`：宿主进程 preload，三层拦截——① 凭证请求本地回
+- `src/repo-snapshot-guard.cjs`：宿主进程 preload，四层拦截——① 凭证请求本地回
   `{code:0,data:null}`（运行时把 null 当「服务端没发凭证」，`captureBeforePromptUnsafe` 在扫描/打包
   **之前**就 return，`zcode-server.cjs` 里 `getUploadKey() === null => return`）；② 快照密文的对象上传
   按 OSS 表单特征（`file=repo-snapshot.tar.gz.enc` / `key=repo-snapshot*` / `x-oss-signature` 头）拒 403，
   覆盖「设置了 `settings.httpProxy` 走运行时内置 undici、绕过 globalThis.fetch」以及内存里已缓存的凭证；
-  ③ 拦截 `~/.zcode/v2/checkpoints/*/{pending,tmp,manifests,extra-manifests}/` 的写入（`state.json` 保持可写，
-  状态仓库与宿主不受影响）。每次拦截都写 stderr → `zcode-webui.log` 里的 `[host:stderr] [zcode-webui]
-  repo-snapshot-guard: ...`，可审计。采集失败被运行时 `void scheduled.catch(()=>{})` 吞掉，不会打断对话。
+  **②b** 产物读取拒绝：`checkpoints/*/{pending,tmp}/*` 经 `openAsBlob`（POST 上传体）与
+  `createReadStream`（PUT 变体）的读取直接失败——**3.12.3 起对象上传改走运行时内置 undici**
+  （`objectUploadFetch ?? import_undici.fetch`，preload 补不到），这一层与传输实现解耦：拿不到产物就拼不出
+  上传体。③ 拦截 `~/.zcode/v2/checkpoints/*/{pending,tmp,manifests,extra-manifests}/` 的写入
+  （`state.json` 保持可写，状态仓库与宿主不受影响）。每次拦截都写 stderr → `zcode-webui.log` 里的
+  `[host:stderr] [zcode-webui] repo-snapshot-guard: ...`，可审计。采集失败被运行时
+  `void scheduled.catch(()=>{})` 吞掉，不会打断对话。
 - `src/host.mjs`：`buildHostEnv()` 注入 `NODE_OPTIONS=--require <guard>`（宿主 spawn 的子进程默认继承；
   采集本身就跑在宿主进程里，所以覆盖面不依赖继承）。
+- **每次官方运行时升级后必跑**：`node scripts/dev/repo-snapshot-guard-status.mjs` —— 一把梭检查
+  ①当前 app/运行时/渲染层版本 ②守卫的各个钩子是否仍能对上官方 bundle（凭证端点、`!uploadKey` 提前返回、
+  产物名/OSS 表单字段、`openAsBlob`/`createReadStream`、checkpoint 目录、`globalThis.fetch` 传输，
+  以及对象上传是否已换成内置 undici）③线上宿主是否真的加载了 preload、最近拦了多少次、
+  有没有"守卫武装之后才出现的产物"。任何一项 WARN 都必须先修守卫再继续用。
 - 盘点现状：`node scripts/dev/repo-snapshot-audit.mjs [--json]`（逐工作区列出上次快照时间、是否已被接受、
-  manifest 里 `.git` 占比、残留密文）。自检：`node scripts/dev/repo-snapshot-guard-test.mjs`。
+  manifest 里 `.git` 占比、残留密文）。自检：`node scripts/dev/repo-snapshot-guard-test.mjs`（20 项）。
 - 本机 2026-09-18 的现状：12 个工作区有快照记录，10 份上传已被服务端接受（含 `writing/recabyss`
   今天 05:30Z 那份，`.git` 21.5MiB / 39.3%）；`vBookmarks`、`vbookmarkspro` 两份共 177MiB 密文
   已挪到 `~/.zcode/v2/repo-snapshot-quarantine-20260918T1030Z/`（确认无用可直接删），

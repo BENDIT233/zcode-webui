@@ -76,6 +76,12 @@ check('snapshot artifact upload is refused with 403', upload.json && upload.json
 const ZCODE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-webui-guard-'));
 const wsRoot = path.join(ZCODE_HOME, 'v2', 'checkpoints', '0d8c5c9c184e');
 for (const dir of ['pending', 'tmp', 'manifests', 'extra-manifests']) fs.mkdirSync(path.join(wsRoot, dir), { recursive: true });
+// Payload + manifest fixtures are written by the UNGUARDED parent process: the guarded child
+// must not be able to create them itself, but must be able to read the manifest and must be
+// unable to read the payload (layer 2b).
+fs.writeFileSync(path.join(wsRoot, 'pending', 'a.tar.gz.enc'), 'ciphertext-fixture');
+fs.writeFileSync(path.join(wsRoot, 'tmp', 'a.tar.gz'), 'tarball-fixture');
+fs.writeFileSync(path.join(wsRoot, 'manifests', 'm.json'), '{}');
 
 const fsProbe = `
 const fs = require('node:fs');
@@ -93,7 +99,12 @@ const root = path.join(process.env.ZCODE_HOME, 'v2', 'checkpoints', '0d8c5c9c184
   await attempt('renameIntoPending', () => { fs.writeFileSync(path.join(root, 'scratch'), 'x'); fs.renameSync(path.join(root, 'scratch'), path.join(root, 'pending', 'c.enc')); });
   await attempt('stateWrite', () => fs.writeFileSync(path.join(root, 'state.json'), '{"ok":true}'));
   await attempt('readBack', () => { const v = fs.readFileSync(path.join(root, 'state.json'), 'utf8'); if (v !== '{"ok":true}') throw new Error('unexpected'); });
+  await attempt('manifestRead', () => { fs.readFileSync(path.join(root, 'manifests', 'm.json'), 'utf8'); });
   await attempt('outsideWrite', () => fs.writeFileSync(path.join(process.env.ZCODE_HOME, 'other.json'), '{}'));
+  // layer 2b: the payload cannot be read for upload, whichever fetch implementation is used
+  await attempt('artifactOpenAsBlob', () => fs.openAsBlob(path.join(root, 'pending', 'a.tar.gz.enc')));
+  await attempt('artifactReadStream', () => { const s = fs.createReadStream(path.join(root, 'pending', 'a.tar.gz.enc')); s.destroy(); });
+  await attempt('artifactOpenRead', () => fsp.open(path.join(root, 'tmp', 'a.tar.gz'), 'r'));
   console.log(JSON.stringify(out));
 })();
 `;
@@ -102,8 +113,12 @@ const fsResult = fsRun.json || {};
 for (const key of ['pendingSync', 'tmpAsync', 'manifestSync', 'extraManifestStream', 'openForWrite', 'renameIntoPending']) {
   check('artifact write blocked: ' + key, fsResult[key] === 'EACCES', String(fsResult[key]));
 }
+for (const key of ['artifactOpenAsBlob', 'artifactReadStream', 'artifactOpenRead']) {
+  check('artifact read blocked (layer 2b): ' + key, fsResult[key] === 'EACCES', String(fsResult[key]));
+}
 check('state.json stays writable (host health)', fsResult.stateWrite === 'allowed', String(fsResult.stateWrite));
 check('reading state.json works', fsResult.readBack === 'allowed', String(fsResult.readBack));
+check('reading manifests works (delta base)', fsResult.manifestRead === 'allowed', String(fsResult.manifestRead));
 check('writes outside checkpoints/ are untouched', fsResult.outsideWrite === 'allowed', String(fsResult.outsideWrite));
 
 // ---------- escape hatch ----------

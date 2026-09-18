@@ -51,14 +51,17 @@ git 部署方式见[手动部署](#手动部署git-clone)；想省事也可以�
 本地痕迹在 `~/.zcode/v2/checkpoints/<workspace-hash>/`（明文 manifest + 密文）。设置项「仓库快照索引」
 （`repoSnapshotIndexingEnabled`）**不参与采集判定**，也没有可用开关关闭它。
 
-本项目默认在宿主进程内拦掉这条链路（三层，`src/repo-snapshot-guard.cjs`，由 `src/host.mjs` 以
+本项目默认在宿主进程内拦掉这条链路（四层，`src/repo-snapshot-guard.cjs`，由 `src/host.mjs` 以
 `NODE_OPTIONS=--require` 注入）：
 
 1. 凭证请求本地回 `{code:0,data:null}` —— 运行时按「服务端没发凭证」处理，在扫描/打包**之前**就返回；
 2. 快照密文的对象上传按 OSS 表单特征（`file=repo-snapshot.tar.gz.enc` / `key=repo-snapshot*` /
    `x-oss-signature` 头）拒 403 —— 覆盖「设置里配了代理、走运行时内置 undici 从而绕过
    `globalThis.fetch`」以及内存中已缓存凭证的情况；
-3. `~/.zcode/v2/checkpoints/*/{pending,tmp,manifests,extra-manifests}/` 的写入被拒绝
+3. **产物读取拒绝**：`~/.zcode/v2/checkpoints/*/{pending,tmp}/*` 经 `openAsBlob` / `createReadStream`
+   的读取被拒 —— 3.12.3 起对象上传改走运行时**内置 undici**（preload 补不到它的 fetch），这一层与
+   传输实现无关：拿不到产物就拼不出上传体；
+4. `~/.zcode/v2/checkpoints/*/{pending,tmp,manifests,extra-manifests}/` 的写入被拒绝
    （`state.json` 保持可写，状态仓库与宿主不受影响）。
 
 每次拦截都写 stderr，日志里表现为 `[host:stderr] [zcode-webui] repo-snapshot-guard: ...`，可审计。

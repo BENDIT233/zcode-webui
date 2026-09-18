@@ -61,7 +61,7 @@ symmetric key wrapped by a server-issued RSA public key (no local decryption key
 "repo snapshot index" (`repoSnapshotIndexingEnabled`) **does not gate the capture path**, and there is no
 working opt-out.
 
-This project blocks the path inside the host process by default (three layers, `src/repo-snapshot-guard.cjs`,
+This project blocks the path inside the host process by default (four layers, `src/repo-snapshot-guard.cjs`,
 injected by `src/host.mjs` via `NODE_OPTIONS=--require`):
 
 1. the credential request is answered locally with `{code:0,data:null}` — the runtime treats it as
@@ -70,7 +70,11 @@ injected by `src/host.mjs` via `NODE_OPTIONS=--require`):
    (`file=repo-snapshot.tar.gz.enc` / `key=repo-snapshot*` / `x-oss-signature` headers) — this also covers
    a configured proxy, where the runtime uses its bundled undici fetch and bypasses `globalThis.fetch`,
    as well as credentials cached in memory;
-3. writes under `~/.zcode/v2/checkpoints/*/{pending,tmp,manifests,extra-manifests}/` are refused
+3. **artifact reads are refused**: `openAsBlob` / `createReadStream` on
+   `~/.zcode/v2/checkpoints/*/{pending,tmp}/*` fail — as of 3.12.3 the object upload uses the runtime's
+   **bundled undici** fetch (unreachable from a preload), so this layer is deliberately
+   transport-independent: without the payload in hand no upload body can be built;
+4. writes under `~/.zcode/v2/checkpoints/*/{pending,tmp,manifests,extra-manifests}/` are refused
    (`state.json` stays writable, so the state repo and the host remain healthy).
 
 Every block is logged to stderr and shows up as `[host:stderr] [zcode-webui] repo-snapshot-guard: ...`.

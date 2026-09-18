@@ -14,19 +14,31 @@
 // forensics.
 //
 // This guard is preloaded into the host process (NODE_OPTIONS --require, injected by
-// src/host.mjs) and makes the capture path inert, in three layers:
+// src/host.mjs) and makes the capture path inert, in four layers:
 //   1. the credential request is answered locally with { code: 0, data: null }, which
 //      RepoSnapshotUploadClient.getUploadCredential() maps to "no credential issued";
 //      captureBeforePromptUnsafe() then returns before scanning, packing or encrypting
-//      anything (zcode-server.cjs: getUploadKey() null => return);
+//      anything (zcode-server.cjs: getUploadKey() null => return). The request goes
+//      through the host API transport, which still calls globalThis.fetch on 3.11.2 and
+//      3.12.3 alike — this is the layer that fires in practice (21 live hits on this box);
 //   2. uploads of the snapshot artifact are refused (HTTP 403) — recognized by the OSS
 //      form fields (`file` named repo-snapshot.tar.gz.enc, `key` containing
 //      repo-snapshot) or by x-oss-signature headers. This also covers the proxy
-//      transport (settings.httpProxy), which uses the runtime's bundled undici fetch
-//      and therefore bypasses layer 1, and it covers credentials cached in memory;
+//      transport (settings.httpProxy) and credentials cached in memory. NOTE: 3.12.3
+//      changed the object upload to the runtime's BUNDLED undici fetch
+//      (`objectUploadFetch ?? import_undici.fetch`), which a preload cannot patch, so on
+//      that version this layer only fires if the runtime hands the transport in; layer 2b
+//      below is the transport-independent replacement;
+//   2b. reads of the payload file itself (openAsBlob backs the POST body,
+//      createReadStream the PUT variant) are refused for
+//      ~/.zcode/v2/checkpoints/*/{pending,tmp}/* — without the artifact in hand no
+//      upload can be built, whatever fetch implementation is in play;
 //   3. writes under ~/.zcode/v2/checkpoints/*/{pending,tmp,manifests,extra-manifests}/
 //      are refused, so no artifact can be produced locally either. `state.json` stays
 //      writable on purpose — the state repo keeps working and the host stays healthy.
+//
+// Re-verify after every official runtime update with:
+//   node scripts/dev/repo-snapshot-guard-status.mjs
 //
 // Every block is logged to stderr, which lands in zcode-webui.log as "[host:stderr]
 // [zcode-webui] repo-snapshot-guard: ...", so the disable stays auditable.
@@ -45,12 +57,17 @@ const CREDENTIAL_PATH = '/api/v1/snapshot/upload-credential';
 const ARTIFACT_MARKER = 'repo-snapshot';
 const ARTIFACT_FILE = 'repo-snapshot.tar.gz.enc';
 const ARTIFACT_SUBDIRS = ['pending', 'tmp', 'manifests', 'extra-manifests'];
+// The payload itself lives in pending/ (ciphertext) and tmp/ (plaintext tarball); refusing to
+// read those two is transport-independent, unlike the layer-2 fetch fingerprint below — 3.12.3
+// switched the object upload from globalThis.fetch to the runtime's bundled undici fetch, which a
+// preload cannot patch (see the header note).
+const ARTIFACT_READ_SUBDIRS = ['pending', 'tmp'];
 const CHECKPOINT_ROOT = path.join(
   process.env.ZCODE_HOME ? path.join(process.env.ZCODE_HOME, 'v2') : path.join(os.homedir(), '.zcode', 'v2'),
   'checkpoints',
 );
 
-const STATS = { credential: 0, upload: 0, write: 0 };
+const STATS = { credential: 0, upload: 0, write: 0, read: 0 };
 
 function log(message) {
   try { process.stderr.write('[zcode-webui] repo-snapshot-guard: ' + message + '\n'); } catch (_e) { /* ignore */ }
@@ -133,6 +150,15 @@ function guardedPath(target) {
   return parts.length >= 2 && ARTIFACT_SUBDIRS.indexOf(parts[1]) >= 0 ? abs : null;
 }
 
+// The payload file itself (pending/<x>.tar.gz.enc, tmp/<x>.tar.gz), as opposed to the
+// plaintext manifest/state files the runtime legitimately reads around it.
+function guardedArtifact(target) {
+  const abs = guardedPath(target);
+  if (!abs || abs === CHECKPOINT_ROOT) return null;
+  const parts = path.relative(CHECKPOINT_ROOT, abs).split(path.sep);
+  return parts.length >= 3 && ARTIFACT_READ_SUBDIRS.indexOf(parts[1]) >= 0 ? abs : null;
+}
+
 function denyWrite(abs, api) {
   STATS.write += 1;
   log('refused checkpoint artifact write #' + STATS.write + ' (' + api + ' -> ' + abs + ')');
@@ -141,10 +167,22 @@ function denyWrite(abs, api) {
   return error;
 }
 
+function denyRead(abs, api) {
+  STATS.read += 1;
+  log('refused snapshot artifact read #' + STATS.read + ' (' + api + ' -> ' + abs + ')');
+  const error = new Error('repo snapshot artifacts are disabled by zcode-webui (' + api + ': ' + abs + ')');
+  error.code = 'EACCES';
+  return error;
+}
+
+function deny(abs, api, kind) {
+  return kind === 'read' ? denyRead(abs, api) : denyWrite(abs, api);
+}
+
 // Denied-call delivery that keeps both flavours of the fs API honest: callback callers
 // get the error through their callback, sync callers (and stream factories) get a throw.
-function failDenied(name, args, abs, { async: async_ } = {}) {
-  const error = denyWrite(abs, name);
+function failDenied(name, args, abs, { async: async_, kind = 'write' } = {}) {
+  const error = deny(abs, name, kind);
   if (async_) return Promise.reject(error);
   const callback = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : null;
   if (callback) {
@@ -171,12 +209,29 @@ function patchWrite(target, name, { async: async_, destIndex = 0 } = {}) {
   });
 }
 
+// Artifact readers: openAsBlob() backs the POST upload body, createReadStream() backs the PUT
+// variant. Blocking these makes layer 2 independent of which fetch implementation the runtime
+// happens to use (3.12.3 switched to its bundled undici, which a preload cannot reach).
+function patchRead(target, name, { async: async_ } = {}) {
+  patch(target, name, (original) => function (...args) {
+    if (ENABLED) {
+      const abs = guardedArtifact(args[0]);
+      if (abs) return failDenied(name, args, abs, { async: async_, kind: 'read' });
+    }
+    return original.apply(this, args);
+  });
+}
+
 function patchOpen(target, name, { async: async_ } = {}) {
   patch(target, name, (original) => function (...args) {
     const flags = typeof args[1] === 'string' ? args[1] : typeof args[1] === 'number' ? String(args[1]) : '';
-    if (ENABLED && /[wa]|\+/.test(flags)) {
-      const abs = guardedPath(args[0]);
-      if (abs) return failDenied(name, args, abs, { async: async_ });
+    if (ENABLED) {
+      const artifact = guardedArtifact(args[0]);
+      if (artifact) return failDenied(name, args, artifact, { async: async_, kind: 'read' });
+      if (/[wa]|\+/.test(flags)) {
+        const abs = guardedPath(args[0]);
+        if (abs) return failDenied(name, args, abs, { async: async_ });
+      }
     }
     return original.apply(this, args);
   });
@@ -200,6 +255,11 @@ function installFsGuard() {
   patchOpen(fs, 'open');
   patchOpen(fs, 'openSync');
   patchOpen(fsp, 'open', { async: true });
+  // Layer 2b: the artifact body cannot be read for upload at all, whichever fetch
+  // implementation the runtime picked (openAsBlob => POST body, createReadStream => PUT body).
+  patchRead(fs, 'openAsBlob', { async: true });
+  patchRead(fsp, 'openAsBlob', { async: true });
+  patchRead(fs, 'createReadStream');
 }
 
 function install() {
