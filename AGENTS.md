@@ -194,6 +194,60 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
 - 注意：守卫在宿主进程启动时注入，**改完要重启服务**（`./zcode-service.sh restart`）才对新宿主生效；
   重启窗口照旧看 `/api/background` 的 `activeCount` 为 0。
 
+### 计费/配额查询缓存 + 429 退避（2026-09-18）
+
+现象：设置 → 模型供应商 → 编程套餐 面板显示「套餐查询失败，重试」（渲染层文案 `purchase.entry.retry`）。
+本机日志实证：`GET https://zcode.z.ai/api/v1/zcode-plan/billing/balance` 返回 **HTTP 429**（约 3 小时内 12 次，
+同期 698 次成功）；渲染层与宿主的 usage-stats / coding-plan-availability 都会在面板打开时高频轮询该接口，
+而渲染层把「非 `no_plan` 的 unavailableReason」也判为错误，于是整块面板报错。
+
+处置：`src/api-cache-guard.cjs`（宿主 preload，`src/host.mjs` 与 repo-snapshot 守卫一起注入）：
+
+- 命中 `/api/v1/zcode-plan/billing/(balance|current)`、`/api/monitor/usage/quota/limit`、
+  `/api/biz/subscription/list` 的 GET：**TTL 缓存（默认 30s）+ 并发合并**，UI 反复查询不再逐个打到上游；
+- 上游 429 时进入**指数退避**（60s 起、上限 10min）：窗口内优先回放上一次成功响应（`x-zcode-webui-cache: stale`，
+  页面保持可用），没有缓存才原样透传；恢复后自动复位；
+- 只碰上述只读路径，其余请求原样透传；动作写 stderr → `[host:stderr] [zcode-webui] api-cache-guard: ...`，
+  每 15 分钟打一次 `stats hits=/misses=/coalesced=/backoffSkips=`。
+- 关闭：`ZCODE_WEBUI_BILLING_CACHE_TTL_MS=0`；改路径：`ZCODE_WEBUI_BILLING_CACHE_PATTERN`；
+  退避基数：`ZCODE_WEBUI_BILLING_BACKOFF_BASE_MS`。自检：`node scripts/dev/api-cache-guard-test.mjs`（10 项）。
+- 注：BigModel 侧「未找到可用授权」是运行时**本地**解析授权返回 null（snapshot 落 `not_configured`），
+  3.12.3 下已基本正常（偶发单次），与 429 无关，也不由本守卫处理；本机凭据（`credentials.json`）是
+  AES-256-GCM 加密落盘，裸探针用不了，验证要走运行时自己的 RPC/日志。
+
+## 网络面加固 / 静态缓存 / 日志治理（2026-09-18，v0.6.0）
+
+一批「修复 + 优化 + 加固」，全部有自检（`node scripts/dev/http-hardening-test.mjs`，18 项）：
+
+- **监听地址默认 `127.0.0.1`**（`host` / `--host` / `ZCODE_WEBUI_HOST` 显式改 `0.0.0.0`）。本机 code-server
+  同容器代理 3102，对端全是 loopback，默认收紧无影响。
+- **可选 accessToken 门禁**（`accessToken` / `ZCODE_WEBUI_ACCESS_TOKEN`，默认关）：未认证的 HTML 请求
+  **原地**返回 `web/access.html` 门禁页（200、不重定向——剥前缀代理下绝对路径重定向会跳出 `/proxy/<port>`，
+  这是设计点）；`/api/*`、`/bridge/*`、静态资源、WS upgrade 一律 401/403；`/api/health` 对探测返回
+  最小 `{ok:true,authRequired:true}`（zcode-service.sh / zcode-update.sh 的健康检查不受影响）。
+  Cookie 存令牌的 SHA-256（`zwebui_access`，30 天），改令牌即全部失效。
+- **`/api/fs/list` 限根**：只列 workspace 与 `$HOME` 之内，向上导航在根处截断（picker 的 `..` 行自然消失）。
+- **静态资源缓存**：`/assets|/material-icons|/pdfjs/` 发 `immutable`（文件名带内容哈希），其余发 ETag
+  （304 再验证）；注入脚本 `?v=` 改为进程启动时固定。刷新不再全量重下 58MB 渲染层。
+- **日志治理**：① `zcode-service.sh` start 时按大小轮转（>50MB，留 3 份）；② `src/host.mjs` 的 stderr
+  relay 对 60s 内的完全重复块计数抑制、超 4KB 截断（`stderrTail` 仍留原始尾部供退出诊断）；
+  ③ `[http]` 访问日志跳过轮询类 GET（background/process-metrics/bridge-poll/health/update-check/login-status）；
+  ④ server 每 15min 检查日志 >200MB（`ZCODE_WEBUI_LOG_MAX_MB`）时留 8MiB 尾巴到 `.overflow` 后 truncate
+  （O_APPEND 下安全）。
+- **host 生成合并**：`handleUpgrade` 用 `pendingSpawns`（userKey → in-flight Promise）合并并发首连，
+  消除「同账号两标签页同时首开 → 双 host，被覆盖者脱离 sessions、reaper 永远扫不到」的僵尸泄漏；
+  合并进来的晚到视图按 adopted 处理（Initialize 回放 + hold 门控）。
+- **HOST_PROXY 修复**：`createSession`（WS 主通道）此前漏传 `ZCODE_HTTP_PROXY`，只有 HTTP 回退通道的
+  host 走代理；现在两条通道共用 `hostExtraEnv()`。
+- **pin 守卫先查 RPC 头**（channel/method 不匹配直接 return），大帧不再为拦截判断付全量 JSON.parse。
+- **`/bridge/send` 体积上限** 32MB（`ZCODE_WEBUI_BRIDGE_MAX_BODY_MB`）；`/bridge/poll` 新 waiter 覆盖前先
+  结算旧 waiter；mux pending 10min TTL 清理；bootstrap 的 4001/takeover 死代码移除；HTTP 降级定时器
+  对 CONNECTING 状态的 ws 多给两个 3s 窗口。
+- **guard stats 进 `/api/health`**：`guards.apiCache`（api-cache-guard 经
+  `ZCODE_WEBUI_GUARD_STATS_DIR` 落盘的 JSON，宿主进程写、server 读）。
+- **`zcode-update.sh` 校验链加了第五步**：`guard_check`（跑 repo-snapshot-guard-status.mjs，任一 WARN
+  视为失败走回滚路径；`--no-guard-check` 跳过）。AGENTS 里「升级后必跑」从此自动执行。
+
 ## 其他约定
 
 - 提交信息风格：`feat:` / `fix:` / `chore:` 前缀，正文写动机和要点（参考 `git log`）。

@@ -107,7 +107,7 @@ npm run fetch-renderer                 # downloads the official installer from t
 
 cp config.example.json config.json     # optional; common fields: workspace / oauthProxy / hostProxy
 
-npm start                              # equals node src/server.mjs, default http://0.0.0.0:3102/
+npm start                              # equals node src/server.mjs, listens on http://127.0.0.1:3102/ by default
 ```
 
 For long-running setups prefer `zcode-webui setup --systemd`, or a system-level unit:
@@ -176,6 +176,8 @@ Priority: CLI args ≈ env vars > `config.json` > defaults.
 | Env / flag | config.json | Default | Meaning |
 |---|---|---|---|
 | `ZCODE_WEBUI_PORT` / `--port` | `port` | `3102` | Listen port |
+| `ZCODE_WEBUI_HOST` / `--host` | `host` | `127.0.0.1` | Bind address; set `0.0.0.0` when other machines must reach it (add a gate, see Security notes) |
+| `ZCODE_WEBUI_ACCESS_TOKEN` / `--access-token` | `accessToken` | empty (off) | Optional access token: when set, pages/API/WS all require the cookie obtained with it on the gate page (valid 30 days; changing the token revokes all cookies) |
 | `ZCODE_WEBUI_BASE_PATH` / `--base-path` | `basePath` | empty (root) | URL prefix, e.g. `/zcode` (do NOT set in code-server proxy mode) |
 | `ZCODE_WEBUI_WORKSPACE` / `--workspace` | `workspace` | `$HOME` | Initial workspace directory |
 | `ZCODE_WEBUI_LOCALE` | `locale` | `zh-CN` | UI language |
@@ -289,11 +291,18 @@ cp cli-config.example.json ~/.zcode/cli/config.json && chmod 600 ~/.zcode/cli/co
 
 ## Security notes
 
-- The service listens on `0.0.0.0` and does **no user authentication itself** (local trust model):
-  anyone who can reach the port runs agents as your server's ZCode account. **Always put it behind a
-  reverse proxy / gateway** (code-server login, SSO, basic auth…); never expose the port publicly.
-- `/api/fs/list`, `/api/login/import` and `/api/sessions/terminate` read the filesystem / write the
-  credential store / kill tasks — protected by the same outer auth assumption.
+- The service listens on `127.0.0.1` by default; set `host: "0.0.0.0"` (or `--host` / `ZCODE_WEBUI_HOST`)
+  explicitly when another machine must reach it.
+- It does **no user authentication by itself** (local trust model): anyone who can reach the port runs
+  agents as your server's ZCode account. Before exposing it, either **put it behind a reverse proxy /
+  gateway** (code-server login, SSO, basic auth…) or configure `accessToken` (shared-token gate: the
+  first visit exchanges the token for a cookie on the gate page; pages, APIs and WS upgrades are all
+  covered and it works behind prefix-stripping proxies — use a long random token; the cookie stores
+  only its SHA-256 and changing the token invalidates existing cookies). Never expose the port with
+  neither of the two.
+- `/api/fs/list` only lists directories under the workspace and the user's home (it can no longer map
+  the whole disk); `/api/login/import` and `/api/sessions/terminate` write the credential store /
+  kill tasks — protected by the same gate.
 - Credentials land in `~/.zcode/v2/credentials.json` (0600); `config.json` is gitignored — never commit
   configs containing secrets.
 - The WS token guards against connecting to the wrong WS service; it is NOT authentication.

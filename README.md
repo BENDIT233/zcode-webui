@@ -90,7 +90,7 @@ npm run fetch-renderer                 # 从官方 CDN 下载安装包并提取�
 
 cp config.example.json config.json     # 可选；常用字段 workspace / oauthProxy / hostProxy
 
-npm start                              # 等价于 node src/server.mjs，默认 http://0.0.0.0:3102/
+npm start                              # 等价于 node src/server.mjs，默认只监听 http://127.0.0.1:3102/
 ```
 
 长期运行建议用上面的 `zcode-webui setup --systemd`，或手写系统级单元：
@@ -155,6 +155,8 @@ nginx 保留前缀转发即可（`proxy_pass http://127.0.0.1:3102;` 不带 URI 
 | 环境变量 / 参数 | config.json | 默认 | 说明 |
 |---|---|---|---|
 | `ZCODE_WEBUI_PORT` / `--port` | `port` | `3102` | 监听端口 |
+| `ZCODE_WEBUI_HOST` / `--host` | `host` | `127.0.0.1` | 监听地址；需要其它机器访问时设 `0.0.0.0`（同时自行加门禁，见安全须知） |
+| `ZCODE_WEBUI_ACCESS_TOKEN` / `--access-token` | `accessToken` | 空（关闭） | 可选访问令牌：设置后页面/API/WS 全部要求先用它在门禁页换 Cookie（30 天有效；改令牌即全部失效） |
 | `ZCODE_WEBUI_BASE_PATH` / `--base-path` | `basePath` | 空（根路径） | URL 前缀，如 `/zcode`（code-server 代理模式**不要设置**） |
 | `ZCODE_WEBUI_WORKSPACE` / `--workspace` | `workspace` | `$HOME` | 初始工作区目录 |
 | `ZCODE_WEBUI_LOCALE` | `locale` | `zh-CN` | 界面语言 |
@@ -257,9 +259,13 @@ cp cli-config.example.json ~/.zcode/cli/config.json && chmod 600 ~/.zcode/cli/co
 
 ## 安全须知
 
-- 服务默认监听 `0.0.0.0` 且**自身不做用户鉴权**（本地信任模型）：任何能访问端口的人都能以服务器上的
-  ZCode 账号身份运行 Agent。**务必放在反代/网关之后**（code-server 登录、SSO、basic auth 等），不要直接暴露公网。
-- `/api/fs/list`、`/api/login/import`、`/api/sessions/terminate` 能读文件系统/写凭据库/终止任务，同样依赖外层鉴权。
+- 服务默认只监听 `127.0.0.1`；需要其它机器访问时用 `host: "0.0.0.0"`（或 `--host` / `ZCODE_WEBUI_HOST`）显式打开。
+- 服务自身**默认不做用户鉴权**（本地信任模型）：任何能访问端口的人都能以服务器上的 ZCode 账号身份运行
+  Agent。暴露到网络前二选一：**放反代/网关之后**（code-server 登录、SSO、basic auth 等），或配置
+  `accessToken`（共享令牌门禁：首次访问在门禁页输入令牌换 Cookie，页面/API/WS 全覆盖，兼容剥前缀代理；
+  令牌请用长随机串，Cookie 只存其 SHA-256，修改令牌立即令旧 Cookie 失效）。不要不做任何一种就暴露公网。
+- `/api/fs/list` 只列出工作区与用户主目录之内的目录（无法再用它枚举全盘）；
+  `/api/login/import`、`/api/sessions/terminate` 能写凭据库/终止任务，同样依赖上述门禁。
 - 凭据写入 `~/.zcode/v2/credentials.json`（0600）；`config.json` 不入库，不要提交含密钥的配置。
 - WS token 只是防误连其他 WS 服务，不是鉴权手段。
 - 官方客户端的「工作区快照」后台上传（含 `.git` 全量历史）在本项目中**默认被禁用**，
