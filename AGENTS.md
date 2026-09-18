@@ -248,6 +248,24 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
 - **`zcode-update.sh` 校验链加了第五步**：`guard_check`（跑 repo-snapshot-guard-status.mjs，任一 WARN
   视为失败走回滚路径；`--no-guard-check` 跳过）。AGENTS 里「升级后必跑」从此自动执行。
 
+## 「完全访问」模式的官方语义（2026-09-18 排查结论）
+
+用户反馈「选了完全访问也不管用，每次都问」。受控复现（`scripts/dev/mode-switch-repro.mjs`，
+真浏览器跑官方渲染层）证明**垫片层没有问题**——空闲时或回合流式输出中切换都正常：
+`switchCollaborationMode` 经桥往返成功、mode=yolo 落 localStorage（`zcode-v4-composer-drafts:v1:<ws>`
+的 session scope + `zcode-model-selection-recent-v1:<ws>` 工作区默认）、后续写命令不再弹框、
+刷新保持。造成体感「不管用」的是官方语义：
+
+1. **模式按「会话 × 浏览器」记忆**，不是全局/账号级设置。每个会话各自记（composer 草稿），
+   存在浏览器 localStorage，不随账号走——换设备/换浏览器回到默认「变更前确认(build)」。
+   其它已存在的会话也不会跟随新选择（tasks 表里 recabyss 全部 mode=build，尽管其 session
+   permission 五天前就是 yolo）。
+2. **权限确认卡挂起时会取代整个输入区**：正被问的时刻模式下拉根本不可见；且切换动作若撞上
+   挂起的权限请求会被回滚（复现：切成功显示完全访问 → 权限卡一出现 → 重开已回退 build）。
+   卡上只有 允许(仅此一次)/始终允许本项目(**仅同一条命令**免问)/拒绝/告诉模型。
+3. **正确用法**：会话空闲（无挂起确认）时点输入框旁模式下拉 → 完全访问。该会话即不再问，
+   同工作区**新会话**在该设备默认继承 yolo。老会话/其它设备需各自切一次。
+
 ## 其他约定
 
 - 提交信息风格：`feat:` / `fix:` / `chore:` 前缀，正文写动机和要点（参考 `git log`）。
