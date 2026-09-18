@@ -266,6 +266,31 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
 3. **正确用法**：会话空闲（无挂起确认）时点输入框旁模式下拉 → 完全访问。该会话即不再问，
    同工作区**新会话**在该设备默认继承 yolo。老会话/其它设备需各自切一次。
 
+## 重置机会自动使用（quota-reset-guard，2026-09-18）
+
+官方编程套餐偶尔发放「重置额度」机会（5 小时池 / 周额度各一种，`/api/v1/coding-plan/reset/status`
+里的 `available_five_hour_resets`/`available_week_resets`，各带 `expire_at`）。本项目让宿主进程
+自动**择机**使用（`src/quota-reset-guard.cjs`，host.mjs 注入 preload，与另两个 guard 并列）：
+
+- **策略**（原则：留到最需要、不浪费）：
+  1. 有任务活跃（tasks-index 最近 10 分钟有 running 更新）**且**对应池余量 ≤5% → 用；
+  2. 模型调用出现 402（配额耗尽硬信号）且机会将过期 → 用；
+  3. 机会自身即将过期（5h≤30min / 周≤2h）**且**池用量 ≥30%（重置有实际价值）→ 挽救性使用；
+  4. 空闲、池健康、机会不过期 → 一律不用；每日上限 6 次；用后必须等 `/status` 确认才允许下一次。
+- **机制**：观察运行时自己的 fetch（`/reset/status`、billing/balance——从中解析机会与池余量，
+  具名桶优先、同类取更近到期）；捕获运行时请求里的双 JWT 头（`Authorization` +
+  `X-Bigmodel-Authorization` + scope 头）**重放**给自己发起的只读 `/status` 轮询（10min 一次）与
+  `/use`（uuid 幂等键，用后轮询确认）。凭据不落盘。子进程（agent）只上报 402 信号。
+- **开关**：`ZCODE_WEBUI_QUOTA_RESET=on|dry-run|off`（默认 on；dry-run 只记录决策不发请求）。
+  其余阈值 env 见文件头（比例/过期窗口/冷却/日上限/头最大年龄/活跃窗口/余额新鲜度）。
+- **观测**：stderr `[zcode-webui] quota-reset-guard:`；状态 JSON 在
+  `<dataHome>/data/guard-stats/quota-reset-guard.json`，`/api/health` → `guards.quotaReset`
+  （机会数、最近决策、当日使用次数、busy）。
+- **注意**：授权头只能从运行时真实请求捕获——**界面长期不打开时头会过期**（默认 12h 窗口），
+  引擎会安全停摆并在日志说明；打开一次页面即恢复。`dry-run` 先跑一段时间观察决策是否符合预期
+  是安全的验证方式。自检：`node scripts/dev/quota-reset-guard-test.mjs`（39 项，全离线 mock，
+  绝不触真实 API）。
+
 ## 其他约定
 
 - 提交信息风格：`feat:` / `fix:` / `chore:` 前缀，正文写动机和要点（参考 `git log`）。

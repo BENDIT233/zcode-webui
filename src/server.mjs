@@ -615,6 +615,26 @@ function guardStatsSnapshot() {
   } catch (_e) { return null; }
 }
 
+// quota-reset-guard state (chances seen, last decision, uses today) — written by
+// the HOST process, read here for observability
+function quotaResetSnapshot() {
+  try {
+    const j = JSON.parse(readFileSync(path.join(PATHS.dataHome, 'data', 'guard-stats', 'quota-reset-guard.json'), 'utf8'));
+    return {
+      mode: j.mode || null, at: j.at || null,
+      chances: {
+        fiveHour: j.status ? (j.status.fiveHourResets || []).length : null,
+        week: j.status ? (j.status.weekResets || []).length : null,
+        statusAt: j.status ? j.status.at : null,
+      },
+      busy: typeof j.busy === 'boolean' ? j.busy : null,
+      usesToday: j.usesToday ?? null, lastUsedAt: j.lastUsedAt || null, lastUsedType: j.lastUsedType || null,
+      confirmed: typeof j.confirmed === 'boolean' ? j.confirmed : null,
+      lastDecision: j.lastDecision || null,
+    };
+  } catch (_e) { return null; }
+}
+
 // ---------- log export (Help menu → 导出日志) ----------
 // Plain-text bundle: service snapshot + process tree + the service log tail.
 // The browser side turns this into a downloaded file; the renderer's own toast
@@ -1213,7 +1233,7 @@ function handleRequest(req, res) {
       httpRelays: httpRelays.size,
       bindHost: BIND_HOST,
       accessGate: !!ACCESS_TOKEN,
-      guards: { apiCache: guardStatsSnapshot() },
+      guards: { apiCache: guardStatsSnapshot(), quotaReset: quotaResetSnapshot() },
     });
   }
   if (urlPath === '/api/login/status') {

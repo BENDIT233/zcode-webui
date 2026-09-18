@@ -104,7 +104,11 @@ export function buildHostEnv(serverRoot, extra = {}) {
   //                         (opt out with ZCODE_WEBUI_ALLOW_REPO_SNAPSHOT=1);
   //   api-cache-guard     — coalesces the renderer's plan/quota polling and backs off on
   //                         HTTP 429, which is what made the settings panel show
-  //                         "套餐查询失败" (opt out with ZCODE_WEBUI_BILLING_CACHE_TTL_MS=0).
+  //                         "套餐查询失败" (opt out with ZCODE_WEBUI_BILLING_CACHE_TTL_MS=0);
+  //   quota-reset-guard   — auto-uses coding-plan reset chances only when they are
+  //                         actually needed (pool nearly gone with tasks running, or
+  //                         the chance itself about to lapse) — opt out with
+  //                         ZCODE_WEBUI_QUOTA_RESET=off, audit with =dry-run.
   const preload = (file) => {
     const guard = path.join(PROJECT_ROOT, 'src', file);
     if (existsSync(guard) && !String(env.NODE_OPTIONS || '').includes(guard)) {
@@ -113,6 +117,7 @@ export function buildHostEnv(serverRoot, extra = {}) {
   };
   if (env.ZCODE_WEBUI_ALLOW_REPO_SNAPSHOT !== '1') preload('repo-snapshot-guard.cjs');
   preload('api-cache-guard.cjs');
+  preload('quota-reset-guard.cjs');
   return env;
 }
 
