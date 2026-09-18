@@ -119,6 +119,7 @@ usage() {
       --no-restart      更新后不重启服务
       --no-smoke        跳过更新后的 smoke 校验
       --no-ui-check     跳过更新后的界面启动校验
+      --no-guard-check  跳过更新后的守卫自检（repo-snapshot/api-cache 钩子对齐）
       --no-auto-rollback 校验失败时不自动回滚
   -y, --yes             全自动，不询问
   -h, --help            显示本帮助
@@ -136,6 +137,7 @@ KEEP_BACKUP=1
 DO_RESTART=1
 DO_SMOKE=1
 DO_UI_CHECK=1
+DO_GUARD_CHECK=1
 AUTO_ROLLBACK=1
 STABLE_ONLY=0
 ASSUME_YES=0
@@ -158,6 +160,7 @@ while [[ $# -gt 0 ]]; do
     --no-restart)    DO_RESTART=0; shift ;;
     --no-smoke)      DO_SMOKE=0; shift ;;
     --no-ui-check)   DO_UI_CHECK=0; shift ;;
+    --no-guard-check) DO_GUARD_CHECK=0; shift ;;
     --no-auto-rollback) AUTO_ROLLBACK=0; shift ;;
     -y|--yes)        ASSUME_YES=1; shift ;;
     -h|--help)       usage; exit 0 ;;
@@ -316,6 +319,26 @@ ui_check() {
   if [[ "$rc" == "0" ]]; then ok '界面启动校验通过'; return 0; fi
   if [[ "$rc" == "3" ]]; then warn '界面启动校验跳过（环境缺少 Chromium）'; return 0; fi
   fail '界面启动校验失败：渲染层没有真正画出界面'
+  return 1
+}
+
+# 守卫自检：repo-snapshot / api-cache 守卫的钩子是否仍对得上刚装好的运行时，
+# 以及线上宿主是否真的加载了守卫（AGENTS.md 要求每次升级后必跑——挂进链路里，
+# 免得靠人记）。任一 WARN 视为校验失败，走与 smoke/ui-check 相同的回滚路径：
+# 新运行时若改了 bundle 结构导致守卫失效，回滚到备份版本正是恢复手段。
+guard_check() {
+  if [[ "$DO_GUARD_CHECK" != "1" ]]; then log '跳过守卫自检（--no-guard-check）'; return 0; fi
+  local script="$SCRIPT_DIR/scripts/dev/repo-snapshot-guard-status.mjs"
+  if [[ ! -f "$script" ]]; then warn '未找到 repo-snapshot-guard-status.mjs，跳过守卫自检'; return 0; fi
+  log '运行守卫自检（守卫钩子对齐 + 线上拦截证据）…'
+  local out rc=0
+  out="$(node "$script" 2>&1)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/    /'
+  if [[ "$rc" == "0" && -z "$(printf '%s\n' "$out" | grep -E '^[[:space:]]*WARN')" ]]; then
+    ok '守卫自检通过'
+    return 0
+  fi
+  fail '守卫自检发现 WARN（守卫钩子可能与新运行时不匹配，先修守卫再继续用）'
   return 1
 }
 
@@ -489,6 +512,7 @@ verify_after_update() { # verify_after_update <target>
 
   smoke_check || bad=1
   ui_check || bad=1
+  guard_check || bad=1
 
   health="$(health_json)"
   hhost="$(json_field "$health" hostVersion)"

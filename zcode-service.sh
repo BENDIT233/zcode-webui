@@ -88,6 +88,21 @@ pid_matches_server() { # pid_matches_server <pid>
 
 is_up() { curl -fsS --max-time 2 "$HEALTH_URL" >/dev/null 2>&1; }
 
+# ---------- 日志轮转（启动时按大小执行；进程内还有溢出保护兜底超长运行） ----------
+rotate_logs() {
+  local max_bytes=$((50 * 1024 * 1024)) keep=3 size i
+  [[ -f "$LOG_FILE" ]] || return 0
+  size="$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)"
+  [[ "$size" =~ ^[0-9]+$ ]] || return 0
+  (( size > max_bytes )) || return 0
+  for (( i = keep; i > 1; i-- )); do
+    [[ -f "$LOG_FILE.$((i - 1))" ]] && mv -f "$LOG_FILE.$((i - 1))" "$LOG_FILE.$i"
+  done
+  mv -f "$LOG_FILE" "$LOG_FILE.1"
+  : > "$LOG_FILE"
+  info "日志已轮转（原 ${size} 字节 > $((max_bytes / 1024 / 1024))MB，保留 ${keep} 份）"
+}
+
 # ---------- 命令 ----------
 start() {
   if is_up; then
@@ -106,6 +121,7 @@ start() {
     done
   fi
   rm -f "$PID_FILE"
+  rotate_logs
 
   info "启动 zcode-webui（端口 $PORT，日志 $LOG_FILE）…"
   local args=(node "$SCRIPT_DIR/src/server.mjs" --port "$PORT")
